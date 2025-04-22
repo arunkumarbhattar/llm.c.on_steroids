@@ -1464,6 +1464,16 @@ void dora_weight_sum(float* out, const float* base, const float* delta, size_t n
     }
 }
 
+
+/*
+ * This function simply executes the forward pass of GPT-2.
+ *
+ * Just takes a batch of input token sequences and processes them through multiple layers of teansofrmer network to predict the probability distribution
+ * for the next token at each position in the sequences.
+ *
+ * During training, there will be target tokens and in that case a loss is calculated (cross-entropy).
+ *
+ */
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     if (model->params_memory == NULL) {
         fprintf(stderr, "Error: Model parameters not initialized\n");
@@ -1476,14 +1486,14 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
 
 
     // Model configuration parameters
-    const size_t V = model->config.vocab_size;
+    const size_t V = model->config.vocab_size; // vocubulary size
     const size_t Vp = model->config.padded_vocab_size;
-    const size_t L = model->config.num_layers;
-    const size_t NH = model->config.num_heads;
-    const size_t C = model->config.channels;
-    const size_t NKVH = model->config.num_kv_heads;  // Get from config
-    const size_t HS = C / NH;
-    const size_t q_dim = NH * HS;
+    const size_t L = model->config.num_layers; //number of transformer layers
+    const size_t NH = model->config.num_heads; // number of query heads in attention
+    const size_t C = model->config.channels; //embedding dimension (model size)
+    const size_t NKVH = model->config.num_kv_heads;  // Number of Key Value heads (GQA)
+    const size_t HS = C / NH; //head size (dimension per head)
+    const size_t q_dim = NH * HS; //query dimension
     const size_t kv_dim = NKVH * HS;
     const size_t qkv_out_dim = q_dim + 2 * kv_dim;  // GQA output dimension for fused QKV
     const size_t OC_fc = 4 * C;
@@ -1507,13 +1517,16 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         printf("Lazily allocating activation memory...\n");
         model->batch_size = B;
         model->seq_len = T;
+        //calculate required sizes for all the activation tensors
         fill_in_activation_sizes(model->act_sizes, model->config, B, T);
         size_t num_activations = 0;
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
         }
         model->num_activations = num_activations;
+        //Allocate one large block adn point struct members to the correct offsets
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
+        //allocate memory to store copies of inputs and targets for the backward pass
         model->inputs = (int*)mallocCheck(B * T * sizeof(int));
         model->targets = (int*)mallocCheck(B * T * sizeof(int));
         printf("Activation memory allocated.\n");
@@ -1530,42 +1543,61 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         memcpy(model->targets, targets, B * T * sizeof(int));
     }
 
+    //set up pointers to model parameters and activations for ease of use later on
     ParameterTensors params = model->params;
     ActivationTensors acts = model->acts;
+    //calculate intial embeddings by summing the token embeddings and position encoding
     encoder_forward(acts.encoded, inputs, params.wte, params.wpe, B, T, C);
 
     const float eps_norm = 1e-5f;
 
     // Process each transformer layer
     for (int l = 0; l < L; l++) {
+
         float* residual = (l == 0) ? acts.encoded : acts.residual3 + (l - 1) * B * T * C;
 
         // --- Layer Norm 1 ---
-        float* l_ln1 = acts.ln1 + l * B * T * C;
+        //layer normalization before the attention block
+        float* l_ln1 = acts.ln1 + l * B * T * C; //pointer to this layer's ln1 op
         layernorm_forward(l_ln1, acts.ln1_mean + l * B * T, acts.ln1_rstd + l * B * T,
                           residual, params.ln1w + l * C, params.ln1b + l * C, B, T, C);
 
+        /*
+         * DORA Based QKV projection to calculate attention
+         */
         {
             size_t size_qkv_weights_layer = qkv_out_dim * C;
+            //for DORA --> this is initial direction V --> that is frozen base weight matrix
             float* W0_adapted = params.qkvw + l * size_qkv_weights_layer;
 
             size_t size_qkv_bias_layer = qkv_out_dim;
             float* bias_adapted_gqa = params.qkvb_gqa + l * size_qkv_bias_layer;
-            float* A = params.qkvw_A + l * r * C;
-            float* B_lora = params.qkvw_B + l * qkv_out_dim * r; // Use GQA dimension
-            float* m = params.qkvw_m + l * qkv_out_dim;            // Use GQA dimension
+            //here we are setting up the effective weight matrix for the QKV projection layer using DORA
+            // directional update Delta_V is calculated using two trainable, low rank LORA matrices A and B.
+            float* A = params.qkvw_A + l * r * C; // DORA A matrix
+            float* B_lora = params.qkvw_B + l * qkv_out_dim * r; // DORA B matrix
+            //qkvw_m is the trainable vector --> one value for each output dimension of the layer
+            float* m = params.qkvw_m + l * qkv_out_dim;            // Dora Magnitude vector
+            //pointers to the activation cahces for the dora intermediates
+            // delta_V = B x A (lora compute)
             float* delta_cache = acts.qkv_delta_cache + l * qkv_out_dim * C; // Use GQA dimension
+            // V' = V + delta_V = W0 (frozen weight = adapted GQA weight) + BA(lora)
             float* V_prime_cache = acts.qkv_V_prime_cache + l * qkv_out_dim * C; // Use GQA dimension
+            //L2 normalized above
             float* norm_V_prime_cache = acts.qkv_norm_V_prime_cache + l * qkv_out_dim; // Use GQA dimension
+            // point to the final effective dora weight matrix
             float* W_dora_cache = acts.qkv_W_dora_cache + l * qkv_out_dim * C; // Use GQA dimension
 
+            //calculate LORA update --> delta = B * A
             matmul_forward(delta_cache, B_lora, A, NULL, qkv_out_dim, 1, r, C);
 
+            //V' = frozen weights + delta (lora)
             #pragma omp parallel for
             for (size_t i = 0; i < qkv_out_dim * C; ++i) {
                 V_prime_cache[i] = W0_adapted[i] + delta_cache[i]; // Use W0_adapted, not W0_gqa
             }
 
+            //calculate column-wise norm
             #pragma omp parallel for
             for (size_t o = 0; o < qkv_out_dim; ++o) {
                 norm_V_prime_cache[o] = vector_norm(V_prime_cache + o * C, C);
@@ -1574,6 +1606,8 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
                  }
             }
 
+            // calculate final dora weight  W_dora = m * (V' / ||V'||c)
+            //put back all that in the dora cache
             #pragma omp parallel for collapse(2)
             for (size_t o = 0; o < qkv_out_dim; ++o) {
                 float inv_norm = 1.0f / (norm_V_prime_cache[o] /*+ eps_norm*/); // eps added implicitly by check above
@@ -1583,16 +1617,23 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
                 }
             }
 
+            //perform actual QKV projection qkv = ln1 * W_dora + bias
             matmul_forward(acts.qkv + l * B * T * qkv_out_dim, l_ln1, W_dora_cache, bias_adapted_gqa, B, T, C, qkv_out_dim);
         }
 
+        // here is where we perform the attention --> with Q, K ,V projections
         float* l_atty = acts.atty + l * B * T * C;
+        //--> takes in the projections --> and outputs attention, pre-softmqax scores
         attention_forward(l_atty,
                           acts.preatt + l * B * NH * T * T,
                           acts.att + l * B * NH * T * T,
                           acts.qkv + l * B * T * qkv_out_dim,
                           B, T, C, NH, model->config.num_kv_heads);
 
+        // attention function above generates attention score for each token --> l_atty --> which basically
+        // how much should each token attend to others
+        // Now is attention output projection layer -->
+        //project attention output back to model dimension C (input vector)--> using dora weights -->
         {
             float* W0 = params.attprojw + l * C * C;
             float* bias = params.attprojb + l * C;
@@ -1614,18 +1655,23 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
                 float scale = m[o] / (norm_V_prime_cache[o] /*+ eps_norm*/);
                 for (size_t i = 0; i < C; ++i) W_dora_cache[o * C + i] = scale * V_prime_cache[o * C + i];
             }
+            //do the attention projection
             matmul_forward(acts.attproj + l * B * T * C, l_atty, W_dora_cache, bias, B, T, C, C);
         }
 
-
+        // Residual connection 1
+        // add the input of the residual layer to the output of the attention projection -->
         float* l_residual2 = acts.residual2 + l * B * T * C;
         residual_forward(l_residual2, residual, acts.attproj + l * B * T * C, B * T * C);
 
 
+        // throw in another layer normalization
         float* l_ln2 = acts.ln2 + l * B * T * C;
         layernorm_forward(l_ln2, acts.ln2_mean + l * B * T, acts.ln2_rstd + l * B * T,
                           l_residual2, params.ln2w + l * C, params.ln2b + l * C, B, T, C);
 
+        // MLP Feed forward layer -->
+        // here we expand the dimension from C -> 4C --> once again we use DORA weights here
         {
             float* W0 = params.fcw + l * OC_fc * C;
             float* bias = params.fcb + l * OC_fc;
@@ -1650,9 +1696,11 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
             matmul_forward(acts.fch + l * B * T * OC_fc, l_ln2, W_dora_cache, bias, B, T, C, OC_fc);
         }
 
+        //elementwise GELU
         float* l_fch_gelu = acts.fch_gelu + l * B * T * OC_fc;
         gelu_forward(l_fch_gelu, acts.fch + l * B * T * OC_fc, B * T * OC_fc);
 
+        //MLP-2 --> reduce dimension from 4*C ---> C
         {
              float* W0 = params.fcprojw + l * C * OC_fc;
              float* bias = params.fcprojb + l * C;
@@ -1677,20 +1725,25 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
              matmul_forward(acts.fcproj + l * B * T * C, l_fch_gelu, W_dora_cache, bias, B, T, OC_fc, C);
         }
 
+        // fcproj = fchgelu * W_dora + bias
         residual_forward(acts.residual3 + l * B * T * C,
                          l_residual2,
                          acts.fcproj + l * B * T * C,
                          B * T * C);
     }
 
+    // Final layer normalization -->
     float* final_residual = acts.residual3 + (L - 1) * B * T * C;
     layernorm_forward(acts.lnf, acts.lnf_mean, acts.lnf_rstd,
                       final_residual, params.lnfw, params.lnfb,
                       B, T, C);
 
+    // Logits calculation
     matmul_forward(acts.logits, acts.lnf, params.wte, NULL, B, T, C, Vp);
+    //softmax
     softmax_forward(acts.probs, acts.logits, B, T, V, Vp);
 
+    // Lsos calculation
     if (targets) {
         crossentropy_forward(model->acts.losses, acts.probs, targets, B, T, Vp);
         double loss_sum = 0.0;
@@ -1703,6 +1756,8 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         model->mean_loss = -1.0f;
     }
 }
+
+// this is just to recent the gradients from the previous pass -->
 
 void gpt2_zero_grad(GPT2 *model) {
     if(model->grads_memory != NULL) {
@@ -1757,8 +1812,10 @@ void gpt2_backward(GPT2 *model) {
         exit(1);
     }
 
+    // if this is the first backward pass --> allocate memory to store the gradients
     if (model->grads_memory == NULL) {
         printf("Lazily allocating gradient memory...\n");
+
         model->grads_memory = malloc_and_point_parameters(&model->grads, model->param_sizes);
         model->grads_acts_memory = malloc_and_point_activations(&model->grads_acts, model->act_sizes);
 
@@ -1791,6 +1848,7 @@ void gpt2_backward(GPT2 *model) {
                  (size_att_A_layer + size_att_B_layer + size_att_m_layer) +
                  (size_fc_A_layer  + size_fc_B_layer  + size_fc_m_layer) +
                  (size_fcp_A_layer + size_fcp_B_layer + size_fcp_m_layer));
+        //allocate one big chunk of memory and have pointers point to different sections for different gradients
         model->grads_memory_dora = (float*)calloc(total_dora_grads_size, sizeof(float));
         if (model->grads_memory_dora == NULL) { exit(1); }
         printf("Allocated %.2f MB for ALL DORA gradients\n",
@@ -1837,6 +1895,11 @@ void gpt2_backward(GPT2 *model) {
     size_t OC_fc = 4 * C;
     size_t r = model->dora_rank;
 
+    /*
+     * Temporary storage for DORA backward pass
+     * will be reused across DORA layers
+     *
+     */
     size_t max_OC = fmax(qkv_out_dim, fmax(C, OC_fc));
     size_t max_C_in = fmax(C, OC_fc);
     size_t max_r_C_in = fmax(r * C, r * OC_fc);
@@ -1846,23 +1909,32 @@ void gpt2_backward(GPT2 *model) {
     float* temp_grad_A    = grad_V_prime + max_OC * max_C_in;      // Size: max_r_C_in
     float* temp_grad_B    = temp_grad_A + max_r_C_in;              // Size: max_C_out_r
 
+    //initialize the gradients for backpropagation
     float dloss_mean = 1.0f / (B * T);
     #pragma omp parallel for
     for (size_t i = 0; i < B * T; i++) {
         model->grads_acts.losses[i] = dloss_mean;
     }
 
+    //backpropagate from behind -->
+
+    //backprop through cross-entropy and softmax together
     crossentropy_softmax_backward(model->grads_acts.logits, model->grads_acts.losses,
                                   model->acts.probs, model->targets, B, T, V, Vp);
+    //backprop through the final logits calculation
+
     matmul_backward(model->grads_acts.lnf, model->grads.wte, NULL,
                     model->grads_acts.logits, model->acts.lnf, model->params.wte,
                     B, T, C, Vp);
+
+    //backprop through final layer normalization
     float* final_residual = model->acts.residual3 + (L - 1) * B * T * C;
     float* dresidual_final = model->grads_acts.residual3 + (L - 1) * B * T * C;
     layernorm_backward(dresidual_final, model->grads.lnfw, model->grads.lnfb,
                        model->grads_acts.lnf, final_residual, model->params.lnfw,
                        model->acts.lnf_mean, model->acts.lnf_rstd, B, T, C);
 
+    //backprop through transformer layers
     for (int l = L - 1; l >= 0; l--) {
         float* residual = (l == 0) ? model->acts.encoded : model->acts.residual3 + (l - 1) * B * T * C;
         float* dresidual = (l == 0) ? model->grads_acts.encoded : model->grads_acts.residual3 + (l - 1) * B * T * C;
@@ -2101,20 +2173,28 @@ void gpt2_backward(GPT2 *model) {
                       model->grads_acts.encoded, model->inputs, B, T, C);
 }
 
+//basically this is the AdamW optimizer
+// at this point the gpt2_backward has already calculated the gradients
+// now this bad boy will apply those optimizr changes to modify the models tranable parameters
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2,
                  float eps, float weight_decay, int t) {
+    // lazy allocation of optimizer states
+    //Adamw needs to keep track of momentum and variance for each parameter
     if (model->m_memory == NULL) {
         model->m_memory = (float*)calloc(model->num_parameters, sizeof(float));
         model->v_memory = (float*)calloc(model->num_parameters, sizeof(float));
         assert(model->m_memory != NULL && model->v_memory != NULL);
         printf("Warning: Base optimizer states allocated in gpt2_update.\n");
     }
+
+    //for dora parameters
     if (model->m_memory_dora == NULL && model->num_parameters_dora > 0) {
         model->m_memory_dora = (float*)calloc(model->num_parameters_dora, sizeof(float));
         model->v_memory_dora = (float*)calloc(model->num_parameters_dora, sizeof(float));
         assert(model->m_memory_dora != NULL && model->v_memory_dora != NULL);
         printf("Warning: DORA optimizer states allocated in gpt2_update.\n");
     }
+
     if (model->num_parameters_dora == 0) {
         fprintf(stderr, "Warning: Trying to update DORA params, but none seem allocated.\n");
     }
@@ -2147,8 +2227,10 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2,
     size_t size_fcp_m_layer = C;
 
 
+    //offsets with the flat DORA arrays
     size_t current_dora_offset = 0;
 
+    //QKV offsets
     size_t dora_offset_qkv_A = current_dora_offset;
     current_dora_offset += L * size_qkv_A_layer;
     size_t dora_offset_qkv_B = current_dora_offset;
@@ -2156,6 +2238,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2,
     size_t dora_offset_qkv_m = current_dora_offset;
     current_dora_offset += L * size_qkv_m_layer;
 
+    //AttProj offsets
     size_t dora_offset_att_A = current_dora_offset;
     current_dora_offset += L * size_att_A_layer;
     size_t dora_offset_att_B = current_dora_offset;
@@ -2184,6 +2267,9 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2,
     for (int j = 0; j < NUM_PARAMETER_TENSORS; j++) {
         size_t num_param_tensor = model->param_sizes[j];
 
+        //best part of this entire project
+        // skip all frozen base weights
+        // 4-> qkvw, 6-> attprojw, 10-> fcw, 12-> fcprojw
         if (j == 4 || j == 6 || j == 10 || j == 12) {
 
             current_base_offset += num_param_tensor;
@@ -2197,7 +2283,14 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2,
         float* v_ptr     = model->v_memory + current_base_offset;
 
         float current_weight_decay = weight_decay;
-        if (j == 0 || j == 1 || j == 2 || j == 3 || j == 5 || j == 7 || j == 8 || j == 9 || j == 11 || j == 13 || j == 14 || j == 15) {
+        //determine weight decay
+        if (j == 0 // wte
+            || j == 1 // wpe
+            || j == 2 || j == 3 //ln1w,ln1b
+            || j == 5 || j == 7 || // qkvb, attprojb
+            j == 8 || j == 9 // ln2w, ln2b
+            || j == 11 || j == 13 //fcb, fcprojb
+            || j == 14 || j == 15) { // lnfw, lnfb
             current_weight_decay = 0.0f;
         }
 
