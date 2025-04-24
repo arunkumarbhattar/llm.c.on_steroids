@@ -28,6 +28,37 @@ There will be other versions of this code that specialize it and make it fast.
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 #include "llmc/dataloader.h"
 
+#include "llmc/sampler.h"
+
+typedef struct {
+    const char* checkpoint_path;
+    const char* tokenizer_path;
+    const char* train_loader_path;
+    const char* val_loader_path;
+    const char* log_file_path;
+    int B;
+    int T;
+    int num_finetune_steps;
+    int val_num_batches;
+    int gen_tokens_for_qualitative;
+    float learning_rate;
+    float beta1;
+    float beta2;
+    float weight_decay;
+    float eps;
+} EvalConfig;
+
+typedef struct {
+    float avg_train_loss;
+    float final_val_loss;
+    double time_per_train_step_ms;
+    double time_per_gen_token_ms;
+    size_t num_dora_params;
+    size_t num_base_params;
+    size_t num_trainable_params;
+    double memory_saved_mb;
+    double memory_saved_percent;
+} EvalResult;
 
 /*
  * Core Architecture: GPT-2 decoder stack with layers consisting of multi-head self-atention
@@ -1143,135 +1174,161 @@ void* callocCheck(size_t num, size_t size) {
 
 
 void allocate_and_init_dora(GPT2 *model, size_t rank_r) {
-    size_t L   = model->config.num_layers;
-    size_t C   = model->config.channels;
-    size_t NH  = model->config.num_heads;
-    size_t NKVH = model->config.num_kv_heads;
-    size_t HS  = C / NH;
-    size_t q_dim = NH * HS;
-    size_t kv_dim = NKVH * HS;
-    size_t OC_qkv_gqa = q_dim + 2 * kv_dim;
-    size_t OC_fc = 4 * C;
-    size_t r = rank_r;
+    const size_t L      = model->config.num_layers;
+    const size_t C      = model->config.channels;
+    const size_t NH     = model->config.num_heads;
+    const size_t NKVH   = model->config.num_kv_heads;
+    const size_t HS     = C / NH;
+    const size_t q_dim  = NH   * HS;
+    const size_t kv_dim = NKVH * HS;
+
+    const size_t OC_qkv_gqa = q_dim + 2 * kv_dim;
+    const size_t OC_fc      = 4 * C;
+
+    const size_t r = rank_r;
     model->dora_rank = r;
-    int q_heads_per_kv_head = (NKVH == 0) ? 0 : NH / NKVH;
 
-    printf("Initializing DORA (Rank %zu) and Adapting to GQA (NKVH %zu)...\n", r, NKVH);
-    size_t mha_qkvw_layer_size = 3 * C * C;
-    size_t mha_qkvb_layer_size = 3 * C;
+    const int q_heads_per_kv_head = (NKVH == 0) ? 0 : (int)(NH / NKVH);
 
-    if (model->params.qkvw == NULL || model->params.qkvb == NULL) {
-        fprintf(stderr, "ERROR in allocate_and_init_dora: Base qkvw or qkvb pointer is NULL before backup. Check loading.\n");
+    printf("Initializing DoRA (rank %zu) – adapting MHA to GQA (NKVH %zu)…\n", r, NKVH);
+
+    const size_t mha_qkvw_layer_size = 3 * C * C;
+    const size_t mha_qkvb_layer_size = 3 * C;
+
+    if (!model->params.qkvw || !model->params.qkvb) {
+        fprintf(stderr, "[allocate_and_init_dora] ERROR: base qkvw/qkvb not loaded.\n");
         exit(EXIT_FAILURE);
     }
-     uintptr_t qkvb_addr = (uintptr_t)model->params.qkvb;
-     if (qkvb_addr < 0x10000) {
-         fprintf(stderr, "ERROR in allocate_and_init_dora: model->params.qkvb (%p) seems invalid before backup.\n", model->params.qkvb);
-         exit(EXIT_FAILURE);
-     }
+    if ((uintptr_t)model->params.qkvb < 0x10000) {
+        fprintf(stderr, "[allocate_and_init_dora] ERROR: qkvb pointer %p looks bogus.\n", model->params.qkvb);
+        exit(EXIT_FAILURE);
+    }
 
-    printf("Backing up original MHA weights and biases...\n");
-    float* temp_mha_qkvw = (float*)mallocCheck(L * mha_qkvw_layer_size * sizeof(float));
-    float* temp_mha_qkvb = (float*)mallocCheck(L * mha_qkvb_layer_size * sizeof(float));
+    printf("Backing up original MHA QKV weights/biases…\n");
+    float *temp_mha_qkvw = (float*)mallocCheck(L * mha_qkvw_layer_size * sizeof(float));
+    float *temp_mha_qkvb = (float*)mallocCheck(L * mha_qkvb_layer_size * sizeof(float));
     memcpy(temp_mha_qkvw, model->params.qkvw, L * mha_qkvw_layer_size * sizeof(float));
     memcpy(temp_mha_qkvb, model->params.qkvb, L * mha_qkvb_layer_size * sizeof(float));
     printf("Backup complete.\n");
 
-    size_t size_qkv_A_layer = r * C;
-    size_t size_qkv_B_layer = OC_qkv_gqa * r;
-    size_t size_qkv_m_layer = OC_qkv_gqa;
-    size_t size_att_A_layer = r * C;
-    size_t size_att_B_layer = C * r;
-    size_t size_att_m_layer = C;
-    size_t size_fc_A_layer  = r * C;
-    size_t size_fc_B_layer  = OC_fc * r;
-    size_t size_fc_m_layer  = OC_fc;
-    size_t size_fcp_A_layer = r * OC_fc;
-    size_t size_fcp_B_layer = C * r;
-    size_t size_fcp_m_layer = C;
+#define LAYER_BLOCK(A,B,M) (A + B + M)
 
-    size_t total_dora_params = L * ( (size_qkv_A_layer + size_qkv_B_layer + size_qkv_m_layer) +
-                                     (size_att_A_layer + size_att_B_layer + size_att_m_layer) +
-                                     (size_fc_A_layer  + size_fc_B_layer  + size_fc_m_layer) +
-                                     (size_fcp_A_layer + size_fcp_B_layer + size_fcp_m_layer) );
-    model->num_parameters_dora = total_dora_params;
-    printf("Allocating %.2f MB for DORA parameters (rank %zu, GQA NKVH %d)...\n",
-           model->num_parameters_dora * sizeof(float) / (1024.0f * 1024.0f), r, (int)NKVH);
+    const size_t size_qkv_A_layer = r * C;            // [r , C]
+    const size_t size_qkv_B_layer = OC_qkv_gqa * r;   // [OC , r]
+    const size_t size_qkv_m_layer = OC_qkv_gqa;       // [OC]
+
+    const size_t size_att_A_layer = r * C;            // [r , C]
+    const size_t size_att_B_layer = C * r;            // [C , r]
+    const size_t size_att_m_layer = C;                // [C]
+
+    const size_t size_fc_A_layer  = r * C;            // [r , C]
+    const size_t size_fc_B_layer  = OC_fc * r;        // [OC , r]
+    const size_t size_fc_m_layer  = OC_fc;            // [OC]
+
+    const size_t size_fcp_A_layer = r * OC_fc;        // [r , OC]
+    const size_t size_fcp_B_layer = C * r;            // [C , r]
+    const size_t size_fcp_m_layer = C;                // [C]
+
+    const size_t size_qkv_bias_layer_gqa = OC_qkv_gqa; // [OC]
+
+    const size_t total_dora_params = L * (
+        LAYER_BLOCK(size_qkv_A_layer, size_qkv_B_layer, size_qkv_m_layer) +
+        LAYER_BLOCK(size_att_A_layer, size_att_B_layer, size_att_m_layer) +
+        LAYER_BLOCK(size_fc_A_layer , size_fc_B_layer , size_fc_m_layer ) +
+        LAYER_BLOCK(size_fcp_A_layer, size_fcp_B_layer, size_fcp_m_layer)
+    );
+
+    const size_t total_dora_trainable_size = total_dora_params /* A/B/m */ +
+                                             L * size_qkv_bias_layer_gqa;  /* + GQA bias */
+
+    model->num_parameters_dora = total_dora_params; // keep legacy meaning
+
+    printf("Allocating %.2f MB for DoRA A/B/m (rank %zu)…\n",
+           total_dora_params * sizeof(float) / (1024.0f*1024.0f), r);
 
     model->params_memory_dora = (float*)mallocCheck(total_dora_params * sizeof(float));
-    model->grads_memory_dora  = (float*)callocCheck(total_dora_params, sizeof(float));
-    model->m_memory_dora      = (float*)callocCheck(total_dora_params, sizeof(float));
-    model->v_memory_dora      = (float*)callocCheck(total_dora_params, sizeof(float));
 
-    float* p_ptr = model->params_memory_dora;
-    float* g_ptr = model->grads_memory_dora;
-    // QKV
-    model->params.qkvw_A = p_ptr; model->grads_dora.qkvw_A = g_ptr; p_ptr += L * size_qkv_A_layer; g_ptr += L * size_qkv_A_layer;
-    model->params.qkvw_B = p_ptr; model->grads_dora.qkvw_B = g_ptr; p_ptr += L * size_qkv_B_layer; g_ptr += L * size_qkv_B_layer;
-    model->params.qkvw_m = p_ptr; model->grads_dora.qkvw_m = g_ptr; p_ptr += L * size_qkv_m_layer; g_ptr += L * size_qkv_m_layer;
-    // AttProj
-    model->params.attprojw_A = p_ptr; model->grads_dora.attprojw_A = g_ptr; p_ptr += L * size_att_A_layer; g_ptr += L * size_att_A_layer;
-    model->params.attprojw_B = p_ptr; model->grads_dora.attprojw_B = g_ptr; p_ptr += L * size_att_B_layer; g_ptr += L * size_att_B_layer;
-    model->params.attprojw_m = p_ptr; model->grads_dora.attprojw_m = g_ptr; p_ptr += L * size_att_m_layer; g_ptr += L * size_att_m_layer;
-    // FC
-    model->params.fcw_A = p_ptr; model->grads_dora.fcw_A = g_ptr; p_ptr += L * size_fc_A_layer; g_ptr += L * size_fc_A_layer;
-    model->params.fcw_B = p_ptr; model->grads_dora.fcw_B = g_ptr; p_ptr += L * size_fc_B_layer; g_ptr += L * size_fc_B_layer;
-    model->params.fcw_m = p_ptr; model->grads_dora.fcw_m = g_ptr; p_ptr += L * size_fc_m_layer; g_ptr += L * size_fc_m_layer;
-    // FCProj
-    model->params.fcprojw_A = p_ptr; model->grads_dora.fcprojw_A = g_ptr; p_ptr += L * size_fcp_A_layer; g_ptr += L * size_fcp_A_layer;
-    model->params.fcprojw_B = p_ptr; model->grads_dora.fcprojw_B = g_ptr; p_ptr += L * size_fcp_B_layer; g_ptr += L * size_fcp_B_layer;
-    model->params.fcprojw_m = p_ptr; model->grads_dora.fcprojw_m = g_ptr;
-    printf("DORA pointers assigned.\n");
+    printf("Allocating %.2f MB for DoRA+GQA gradients & optimizer states…\n",
+           total_dora_trainable_size * 3.0 * sizeof(float) / (1024.0f*1024.0f));
+    model->grads_memory_dora = (float*)callocCheck(total_dora_trainable_size, sizeof(float));
+    model->m_memory_dora     = (float*)callocCheck(total_dora_trainable_size, sizeof(float));
+    model->v_memory_dora     = (float*)callocCheck(total_dora_trainable_size, sizeof(float));
 
-    size_t size_qkv_bias_layer_gqa = OC_qkv_gqa;
+
+    float *p_ptr = model->params_memory_dora;
+    model->params.qkvw_A = p_ptr; p_ptr += L * size_qkv_A_layer;
+    model->params.qkvw_B = p_ptr; p_ptr += L * size_qkv_B_layer;
+    model->params.qkvw_m = p_ptr; p_ptr += L * size_qkv_m_layer;
+    model->params.attprojw_A = p_ptr; p_ptr += L * size_att_A_layer;
+    model->params.attprojw_B = p_ptr; p_ptr += L * size_att_B_layer;
+    model->params.attprojw_m = p_ptr; p_ptr += L * size_att_m_layer;
+    model->params.fcw_A = p_ptr; p_ptr += L * size_fc_A_layer;
+    model->params.fcw_B = p_ptr; p_ptr += L * size_fc_B_layer;
+    model->params.fcw_m = p_ptr; p_ptr += L * size_fc_m_layer;
+    model->params.fcprojw_A = p_ptr; p_ptr += L * size_fcp_A_layer;
+    model->params.fcprojw_B = p_ptr; p_ptr += L * size_fcp_B_layer;
+    model->params.fcprojw_m = p_ptr;
+
+    float *g_ptr = model->grads_memory_dora;
+    model->grads_dora.qkvw_A = g_ptr; g_ptr += L * size_qkv_A_layer;
+    model->grads_dora.qkvw_B = g_ptr; g_ptr += L * size_qkv_B_layer;
+    model->grads_dora.qkvw_m = g_ptr; g_ptr += L * size_qkv_m_layer;
+    model->grads_dora.qkvb_gqa = g_ptr; g_ptr += L * size_qkv_bias_layer_gqa;
+    model->grads_dora.attprojw_A = g_ptr; g_ptr += L * size_att_A_layer;
+    model->grads_dora.attprojw_B = g_ptr; g_ptr += L * size_att_B_layer;
+    model->grads_dora.attprojw_m = g_ptr; g_ptr += L * size_att_m_layer;
+    model->grads_dora.fcw_A = g_ptr; g_ptr += L * size_fc_A_layer;
+    model->grads_dora.fcw_B = g_ptr; g_ptr += L * size_fc_B_layer;
+    model->grads_dora.fcw_m = g_ptr; g_ptr += L * size_fc_m_layer;
+    model->grads_dora.fcprojw_A = g_ptr; g_ptr += L * size_fcp_A_layer;
+    model->grads_dora.fcprojw_B = g_ptr; g_ptr += L * size_fcp_B_layer;
+    model->grads_dora.fcprojw_m = g_ptr;
+
+    printf("DoRA param/grad pointers assigned.\n");
+
     model->params.qkvb_gqa = (float*)mallocCheck(L * size_qkv_bias_layer_gqa * sizeof(float));
-    if (model->params.qkvb_gqa == NULL) {
-        fprintf(stderr, "ERROR: Failed to allocate memory for model->params.qkvb_gqa\n");
-        exit(EXIT_FAILURE);
-    }
-    printf("Allocated memory for adapted GQA biases (qkvb_gqa) at address %p.\n", model->params.qkvb_gqa);
+    printf("Allocated qkvb_gqa (trainable GQA biases) @%p\n", (void*)model->params.qkvb_gqa);
 
-    printf("Starting MHA->GQA adaptation and DORA initialization loop...\n");
-    size_t size_qkv_weights_layer_gqa = OC_qkv_gqa * C; // Adapted weight size
+    const size_t size_qkv_weights_layer_gqa = OC_qkv_gqa * C; // W0_qkv_target per‑layer
 
-    for (int l = 0; l < L; ++l) {
-        float* W0_qkv_mha_temp = temp_mha_qkvw + l * mha_qkvw_layer_size;
-        float* b_qkv_mha_temp = temp_mha_qkvb + l * mha_qkvb_layer_size;
-        float* W0_qkv_target = model->params.qkvw + l * size_qkv_weights_layer_gqa;
-        float* b_qkv_target = model->params.qkvb_gqa + l * size_qkv_bias_layer_gqa;
+    printf("Starting MHA→GQA adaptation & DoRA initialisation…\n");
 
-        float* A_qkv = model->params.qkvw_A + l * size_qkv_A_layer;
-        float* B_qkv = model->params.qkvw_B + l * size_qkv_B_layer;
-        float* m_qkv = model->params.qkvw_m + l * size_qkv_m_layer;
+    for (int l = 0; l < (int)L; ++l) {
+        float *W0_qkv_mha_temp = temp_mha_qkvw + l * mha_qkvw_layer_size;
+        float *b_qkv_mha_temp  = temp_mha_qkvb + l * mha_qkvb_layer_size;
 
-        if (b_qkv_target == NULL || b_qkv_mha_temp == NULL) {
-             fprintf(stderr, "ERROR Layer %d: b_qkv_target (%p) or b_qkv_mha_temp (%p) is NULL before memcpy.\n", l, b_qkv_target, b_qkv_mha_temp);
-             exit(EXIT_FAILURE);
+        float *W0_qkv_target = model->params.qkvw + l * size_qkv_weights_layer_gqa;
+        float *b_qkv_target  = model->params.qkvb_gqa + l * size_qkv_bias_layer_gqa;
+
+        if (!b_qkv_target || !b_qkv_mha_temp) {
+            exit(EXIT_FAILURE);
         }
 
-        memcpy(W0_qkv_target, W0_qkv_mha_temp, q_dim * C * sizeof(float)); // Copy Q weights
-        memcpy(b_qkv_target, b_qkv_mha_temp, q_dim * sizeof(float));     // Copy Q biases (CRASH WAS HERE)
+        memcpy(W0_qkv_target,           W0_qkv_mha_temp, q_dim * C * sizeof(float));
+        memcpy(b_qkv_target,            b_qkv_mha_temp , q_dim * sizeof(float));
 
         if (NKVH > 0 && q_heads_per_kv_head > 0) {
             #pragma omp parallel for schedule(static)
-            for (int kv_group_idx = 0; kv_group_idx < NKVH; ++kv_group_idx) {
-                int start_h = kv_group_idx * q_heads_per_kv_head;
-                int end_h   = start_h + q_heads_per_kv_head;
-                float* W0_k_target_group = W0_qkv_target + q_dim * C + kv_group_idx * HS * C;
-                float* W0_v_target_group = W0_qkv_target + q_dim * C + kv_dim * C + kv_group_idx * HS * C;
-                float* b_k_target_group = b_qkv_target + q_dim + kv_group_idx * HS;
-                float* b_v_target_group = b_qkv_target + q_dim + kv_dim + kv_group_idx * HS;
+            for (int kv_group_idx = 0; kv_group_idx < (int)NKVH; ++kv_group_idx) {
+                const int start_h = kv_group_idx * q_heads_per_kv_head;
+                const int end_h   = start_h + q_heads_per_kv_head;
+
+                float *W0_k_target_group = W0_qkv_target + q_dim * C + kv_group_idx * HS * C;
+                float *W0_v_target_group = W0_qkv_target + q_dim * C + kv_dim * C + kv_group_idx * HS * C;
+                float *b_k_target_group  = b_qkv_target   + q_dim + kv_group_idx * HS;
+                float *b_v_target_group  = b_qkv_target   + q_dim + kv_dim + kv_group_idx * HS;
 
                 memset(W0_k_target_group, 0, HS * C * sizeof(float));
                 memset(W0_v_target_group, 0, HS * C * sizeof(float));
-                memset(b_k_target_group, 0, HS * sizeof(float));
-                memset(b_v_target_group, 0, HS * sizeof(float));
+                memset(b_k_target_group , 0, HS * sizeof(float));
+                memset(b_v_target_group , 0, HS * sizeof(float));
 
                 for (int orig_h = start_h; orig_h < end_h; ++orig_h) {
-                    float* W0_k_mha_head = W0_qkv_mha_temp + C * C + orig_h * HS * C;
-                    float* W0_v_mha_head = W0_qkv_mha_temp + 2 * C * C + orig_h * HS * C;
-                    float* b_k_mha_head = b_qkv_mha_temp + C + orig_h * HS;
-                    float* b_v_mha_head = b_qkv_mha_temp + 2 * C + orig_h * HS;
+                    float *W0_k_mha_head = W0_qkv_mha_temp +     C * C + orig_h * HS * C;
+                    float *W0_v_mha_head = W0_qkv_mha_temp + 2 * C * C + orig_h * HS * C;
+                    float *b_k_mha_head  = b_qkv_mha_temp  +     C       + orig_h * HS;
+                    float *b_v_mha_head  = b_qkv_mha_temp  + 2 * C       + orig_h * HS;
+
                     for (size_t i = 0; i < HS * C; ++i) {
                         W0_k_target_group[i] += W0_k_mha_head[i];
                         W0_v_target_group[i] += W0_v_mha_head[i];
@@ -1281,122 +1338,134 @@ void allocate_and_init_dora(GPT2 *model, size_t rank_r) {
                         b_v_target_group[i] += b_v_mha_head[i];
                     }
                 }
-                float inv_group_size = 1.0f / (float)q_heads_per_kv_head;
+                const float inv = 1.0f / (float)q_heads_per_kv_head;
                 for (size_t i = 0; i < HS * C; ++i) {
-                    W0_k_target_group[i] *= inv_group_size;
-                    W0_v_target_group[i] *= inv_group_size;
+                    W0_k_target_group[i] *= inv;
+                    W0_v_target_group[i] *= inv;
                 }
                 for (size_t i = 0; i < HS; ++i) {
-                    b_k_target_group[i] *= inv_group_size;
-                    b_v_target_group[i] *= inv_group_size;
+                    b_k_target_group[i] *= inv;
+                    b_v_target_group[i] *= inv;
                 }
             }
         } else {
-             fprintf(stderr, "Warning: Skipping GQA K/V adaptation in layer %d due to NKVH=%zu or NH/NKVH=%d\n", l, NKVH, q_heads_per_kv_head);
+            fprintf(stderr, "[Layer %d] Warning: NKVH=%zu (skip GQA KV grouping)\n", l, NKVH);
         }
 
-        float eps_norm = 1e-5f;
+        const float eps_norm = 1e-5f;
+
+        float *A_qkv = model->params.qkvw_A + l * size_qkv_A_layer;
+        float *B_qkv = model->params.qkvw_B + l * size_qkv_B_layer;
+        float *m_qkv = model->params.qkvw_m + l * size_qkv_m_layer;
         #pragma omp parallel for schedule(static)
         for (size_t o = 0; o < OC_qkv_gqa; ++o) {
             m_qkv[o] = vector_norm(W0_qkv_target + o * C, C);
-             if (m_qkv[o] < eps_norm) { m_qkv[o] = eps_norm; }
+            if (m_qkv[o] < eps_norm) m_qkv[o] = eps_norm;
         }
         kaiming_uniform_init(A_qkv, size_qkv_A_layer, C);
         memset(B_qkv, 0, size_qkv_B_layer * sizeof(float));
 
-        float* W0_att = model->params.attprojw + l * C * C;
-        float* A_att = model->params.attprojw_A + l * size_att_A_layer;
-        float* B_att = model->params.attprojw_B + l * size_att_B_layer;
-        float* m_att = model->params.attprojw_m + l * size_att_m_layer;
+        /* AttProj */
+        float *W0_att = model->params.attprojw + l * C * C;
+        float *A_att  = model->params.attprojw_A + l * size_att_A_layer;
+        float *B_att  = model->params.attprojw_B + l * size_att_B_layer;
+        float *m_att  = model->params.attprojw_m + l * size_att_m_layer;
         #pragma omp parallel for schedule(static)
         for (size_t o = 0; o < C; ++o) {
             m_att[o] = vector_norm(W0_att + o * C, C);
-            if (m_att[o] < eps_norm) { m_att[o] = eps_norm; }
+            if (m_att[o] < eps_norm) m_att[o] = eps_norm;
         }
         kaiming_uniform_init(A_att, size_att_A_layer, C);
         memset(B_att, 0, size_att_B_layer * sizeof(float));
 
-        float* W0_fc = model->params.fcw + l * OC_fc * C;
-        float* A_fc = model->params.fcw_A + l * size_fc_A_layer;
-        float* B_fc = model->params.fcw_B + l * size_fc_B_layer;
-        float* m_fc = model->params.fcw_m + l * size_fc_m_layer;
+        /* FC */
+        float *W0_fc = model->params.fcw + l * OC_fc * C;
+        float *A_fc  = model->params.fcw_A + l * size_fc_A_layer;
+        float *B_fc  = model->params.fcw_B + l * size_fc_B_layer;
+        float *m_fc  = model->params.fcw_m + l * size_fc_m_layer;
         #pragma omp parallel for schedule(static)
         for (size_t o = 0; o < OC_fc; ++o) {
             m_fc[o] = vector_norm(W0_fc + o * C, C);
-             if (m_fc[o] < eps_norm) { m_fc[o] = eps_norm; }
+            if (m_fc[o] < eps_norm) m_fc[o] = eps_norm;
         }
         kaiming_uniform_init(A_fc, size_fc_A_layer, C);
         memset(B_fc, 0, size_fc_B_layer * sizeof(float));
 
-        float* W0_fcp = model->params.fcprojw + l * C * OC_fc;
-        float* A_fcp = model->params.fcprojw_A + l * size_fcp_A_layer;
-        float* B_fcp = model->params.fcprojw_B + l * size_fcp_B_layer;
-        float* m_fcp = model->params.fcprojw_m + l * size_fcp_m_layer;
+        /* FCProj */
+        float *W0_fcp = model->params.fcprojw + l * C * OC_fc;
+        float *A_fcp  = model->params.fcprojw_A + l * size_fcp_A_layer;
+        float *B_fcp  = model->params.fcprojw_B + l * size_fcp_B_layer;
+        float *m_fcp  = model->params.fcprojw_m + l * size_fcp_m_layer;
         #pragma omp parallel for schedule(static)
         for (size_t o = 0; o < C; ++o) {
             m_fcp[o] = vector_norm(W0_fcp + o * OC_fc, OC_fc);
-            if (m_fcp[o] < eps_norm) { m_fcp[o] = eps_norm; }
+            if (m_fcp[o] < eps_norm) m_fcp[o] = eps_norm;
         }
         kaiming_uniform_init(A_fcp, size_fcp_A_layer, OC_fc);
         memset(B_fcp, 0, size_fcp_B_layer * sizeof(float));
-
     }
-    printf("Adaptation and DORA initialization complete.\n");
 
-    printf("Freeing temporary MHA buffers...\n");
+    printf("Adaptation & DoRA init complete.\n");
+
+
     free(temp_mha_qkvw);
     free(temp_mha_qkvb);
 
-    size_t max_OC_gqa_all = fmax(OC_qkv_gqa, fmax(C, OC_fc));
-    size_t max_C_in_all = fmax(C, OC_fc);
-    size_t max_r_C_in_all = fmax(r * C, r * OC_fc);
-    size_t max_C_out_r_gqa_all = fmax(OC_qkv_gqa * r, fmax(C * r, OC_fc * r));
-    size_t required_temp_elements = (max_OC_gqa_all * max_C_in_all) * 2 + max_r_C_in_all + max_C_out_r_gqa_all + max_OC_gqa_all;
-    model->dora_temp_storage_size = required_temp_elements * sizeof(float);
-    printf("Allocating %.2f MB for DORA backward temporary storage (estimated %zu elements)...\n",
-           model->dora_temp_storage_size / (1024.0f * 1024.0f), required_temp_elements);
-    model->dora_temp_storage = (float*)mallocCheck(model->dora_temp_storage_size);
+    const size_t max_OC_gqa_all        = fmax(OC_qkv_gqa, fmax(C, OC_fc));
+    const size_t max_C_in_all          = fmax(C, OC_fc);
+    const size_t max_r_C_in_all        = fmax(r*C, r*OC_fc);
+    const size_t max_C_out_r_gqa_all   = fmax(OC_qkv_gqa*r, fmax(C*r, OC_fc*r));
+    const size_t tmp_elems = (max_OC_gqa_all * max_C_in_all) * 2 +
+                             max_r_C_in_all + max_C_out_r_gqa_all + max_OC_gqa_all;
+    model->dora_temp_storage_size = tmp_elems * sizeof(float);
+    model->dora_temp_storage      = (float*)mallocCheck(model->dora_temp_storage_size);
 
-    printf("\n--- Memory Usage Comparison (Post DORA/GQA Init) ---\n");
-    size_t gqa_qkvw_count = L * size_qkv_weights_layer_gqa;
-    size_t gqa_qkvb_count = L * size_qkv_bias_layer_gqa; // Using the new GQA bias count
+    printf("Allocated %.2f MB temporary workspace for DoRA backward.\n",
+           model->dora_temp_storage_size / (1024.0f*1024.0f));
+
+    /* -------------------------------------------------------------
+     * 12. Report memory usage
+     * -----------------------------------------------------------*/
+    size_t gqa_qkvw_count   = L * size_qkv_weights_layer_gqa;
+    size_t gqa_qkvb_count   = L * size_qkv_bias_layer_gqa;
     size_t base_attprojw_count = L * C * C;
     size_t base_attprojb_count = L * C;
     size_t base_fcw_count      = L * OC_fc * C;
     size_t base_fcb_count      = L * OC_fc;
     size_t base_fcprojw_count  = L * C * OC_fc;
     size_t base_fcprojb_count  = L * C;
-    size_t other_base_params = model->num_parameters - L * (mha_qkvw_layer_size + mha_qkvb_layer_size + (C*C+C) + (OC_fc*C+OC_fc) + (C*OC_fc+C));
-    if (other_base_params > model->num_parameters) other_base_params = 0;
 
-    size_t total_base_params_after_adapt = gqa_qkvw_count + gqa_qkvb_count + base_attprojw_count + base_attprojb_count +
-                                           base_fcw_count + base_fcb_count + base_fcprojw_count + base_fcprojb_count + other_base_params;
-    size_t frozen_base_weights = gqa_qkvw_count + base_attprojw_count + base_fcw_count + base_fcprojw_count;
-    size_t trainable_base_params_approx = total_base_params_after_adapt - frozen_base_weights;
-    size_t dora_trainable_params_total = model->num_parameters_dora + trainable_base_params_approx;
+    size_t other_base = model->num_parameters -
+        (L * (mha_qkvw_layer_size + mha_qkvb_layer_size + (C*C + C) + (OC_fc*C + OC_fc) + (C*OC_fc + C)));
+    if (other_base > model->num_parameters) other_base = 0;
 
-    printf("Total Base Parameters (Original MHA Loaded): %zu (%.2f MB)\n", model->num_parameters,
-           (model->num_parameters * sizeof(float)) / (1024.0f * 1024.0f));
-     printf("Total Base Parameters (After GQA Adaptation): ~%zu (%.2f MB)\n", total_base_params_after_adapt,
-           (total_base_params_after_adapt * sizeof(float)) / (1024.0f * 1024.0f));
-    printf("Trainable DORA Parameters (A, B, m): %zu (%.2f MB)\n", model->num_parameters_dora,
-           (model->num_parameters_dora * sizeof(float)) / (1024.0f * 1024.0f));
-    printf("Trainable Base Parameters (Estimate: Non-Frozen Biases/Norms/Embed): ~%zu (%.2f MB)\n",
-           trainable_base_params_approx, (trainable_base_params_approx * sizeof(float)) / (1024.0f * 1024.0f));
-    printf("Total Trainable Params (DORA + Base Non-Frozen Estimate): ~%zu (%.2f MB)\n",
-           dora_trainable_params_total, (dora_trainable_params_total * sizeof(float)) / (1024.0f * 1024.0f));
-    double full_ft_memory_mb = (3.0 * model->num_parameters * sizeof(float)) / (1024.0 * 1024.0);
-    double dora_ft_memory_refined_mb = ( (frozen_base_weights * sizeof(float)) +
-                                         (trainable_base_params_approx * 3.0 * sizeof(float)) +
-                                         (model->num_parameters_dora * 3.0 * sizeof(float))
-                                       ) / (1024.0 * 1024.0);
-    double memory_saved_mb = full_ft_memory_mb - dora_ft_memory_refined_mb;
-    double savings_percent = (full_ft_memory_mb > 1e-6) ? (memory_saved_mb / full_ft_memory_mb) * 100.0 : 0.0;
-    printf("Estimated Memory for Parameters + AdamW States:\n");
-    printf("  - Full Fine-Tuning (Estimate based on MHA): %.2f MB\n", full_ft_memory_mb);
-    printf("  - DORA Fine-Tuning (Refined Estimate): %.2f MB\n", dora_ft_memory_refined_mb);
-    printf("Estimated Memory Saved with DORA: %.2f MB (%.1f%%)\n", memory_saved_mb, savings_percent);
-    printf("---------------------------------\n\n");
+    const size_t base_after_adapt = gqa_qkvw_count + gqa_qkvb_count + base_attprojw_count + base_attprojb_count +
+                                    base_fcw_count + base_fcb_count + base_fcprojw_count + base_fcprojb_count + other_base;
+    const size_t frozen_base_w = gqa_qkvw_count + base_attprojw_count + base_fcw_count + base_fcprojw_count;
+    const size_t trainable_base_est = base_after_adapt - frozen_base_w;
+
+    const size_t total_trainable = trainable_base_est + total_dora_trainable_size;
+
+    const double full_ft_mb  = 3.0 * model->num_parameters * sizeof(float) / (1024.0*1024.0);
+    const double dora_ft_mb  = (frozen_base_w * sizeof(float) +
+                               3.0 * (trainable_base_est + total_dora_trainable_size) * sizeof(float)) / (1024.0*1024.0);
+    const double saved_mb    = full_ft_mb - dora_ft_mb;
+    const double saved_pct   = (full_ft_mb > 1e-6) ? (saved_mb / full_ft_mb) * 100.0 : 0.0;
+
+    printf("\n--- Memory Footprint Summary ---\n");
+    printf("Original base params        : %zu (%.2f MB)\n", model->num_parameters,
+           model->num_parameters * sizeof(float) / (1024.0*1024.0));
+    printf("Base params after adaptation: ~%zu (%.2f MB)\n", base_after_adapt,
+           base_after_adapt * sizeof(float) / (1024.0*1024.0));
+    printf("Trainable DoRA A/B/m + bias : %zu (%.2f MB)\n", total_dora_trainable_size,
+           total_dora_trainable_size * sizeof(float) / (1024.0*1024.0));
+    printf("Estimated total trainable    : ~%zu (%.2f MB)\n", total_trainable,
+           total_trainable * sizeof(float) / (1024.0*1024.0));
+    printf("\nParameter + AdamW memory (MB)\n");
+    printf("  – Full fine‑tuning : %.2f\n", full_ft_mb);
+    printf("  – DoRA fine‑tuning : %.2f\n", dora_ft_mb);
+    printf("  → Saved            : %.2f MB (%.1f%%)\n", saved_mb, saved_pct);
+    printf("-------------------------------------------\n\n");
 }
 
 void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
@@ -1833,6 +1902,7 @@ void gpt2_backward(GPT2 *model) {
         size_t size_qkv_A_layer = r * C;
         size_t size_qkv_B_layer = OC_qkv_gqa * r;
         size_t size_qkv_m_layer = OC_qkv_gqa;
+        size_t size_qkv_bias_layer_gqa = OC_qkv_gqa;
         size_t size_att_A_layer = r * C;
         size_t size_att_B_layer = C * r;
         size_t size_att_m_layer = C;
@@ -1843,11 +1913,13 @@ void gpt2_backward(GPT2 *model) {
         size_t size_fcp_B_layer = C * r;
         size_t size_fcp_m_layer = C;
 
-        size_t total_dora_grads_size =
-            L * ((size_qkv_A_layer + size_qkv_B_layer + size_qkv_m_layer) +
-                 (size_att_A_layer + size_att_B_layer + size_att_m_layer) +
-                 (size_fc_A_layer  + size_fc_B_layer  + size_fc_m_layer) +
-                 (size_fcp_A_layer + size_fcp_B_layer + size_fcp_m_layer));
+        size_t total_dora_grads_size = L * (
+                   (size_qkv_A_layer + size_qkv_B_layer + size_qkv_m_layer + size_qkv_bias_layer_gqa) +
+                   (size_att_A_layer + size_att_B_layer + size_att_m_layer) +
+                   (size_fc_A_layer  + size_fc_B_layer  + size_fc_m_layer) +
+                   (size_fcp_A_layer + size_fcp_B_layer + size_fcp_m_layer)
+               );
+
         //allocate one big chunk of memory and have pointers point to different sections for different gradients
         model->grads_memory_dora = (float*)calloc(total_dora_grads_size, sizeof(float));
         if (model->grads_memory_dora == NULL) { exit(1); }
@@ -1859,6 +1931,7 @@ void gpt2_backward(GPT2 *model) {
         model->grads_dora.qkvw_A = g_ptr; g_ptr += L * size_qkv_A_layer;
         model->grads_dora.qkvw_B = g_ptr; g_ptr += L * size_qkv_B_layer;
         model->grads_dora.qkvw_m = g_ptr; g_ptr += L * size_qkv_m_layer;
+        model->grads_dora.qkvb_gqa = g_ptr; g_ptr += L * size_qkv_bias_layer_gqa;
         model->grads_dora.attprojw_A = g_ptr; g_ptr += L * size_att_A_layer;
         model->grads_dora.attprojw_B = g_ptr; g_ptr += L * size_att_B_layer;
         model->grads_dora.attprojw_m = g_ptr; g_ptr += L * size_att_m_layer;
@@ -2112,10 +2185,16 @@ void gpt2_backward(GPT2 *model) {
 
             const size_t InpDim = C;        // Input dimension is C.
             const size_t OutDim = qkv_out_dim; // Output dimension is the new GQA dimension.
+            float* dl_qkvb_gqa_target = model->grads_dora.qkvb_gqa + l * OutDim; // Use grads_dora pointer
 
             memset(grad_dL_dWdora, 0, OutDim * InpDim * sizeof(float));
-            matmul_backward(NULL, grad_dL_dWdora, dl_qkvb, dl_qkv, l_ln1, NULL, B, T, InpDim, OutDim);
-
+            matmul_backward(NULL,
+                            grad_dL_dWdora,
+                            dl_qkvb_gqa_target,
+                            dl_qkv,
+                            l_ln1,
+                            NULL,
+                            B, T, InpDim, OutDim);
             const float eps_div = 1e-5f;
 
             #pragma omp parallel for // Parallelize over output dimension 'o'
@@ -2181,85 +2260,102 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2,
     // lazy allocation of optimizer states
     //Adamw needs to keep track of momentum and variance for each parameter
     if (model->m_memory == NULL) {
-        model->m_memory = (float*)calloc(model->num_parameters, sizeof(float));
-        model->v_memory = (float*)calloc(model->num_parameters, sizeof(float));
-        assert(model->m_memory != NULL && model->v_memory != NULL);
-        printf("Warning: Base optimizer states allocated in gpt2_update.\n");
+        model->m_memory = (float*)callocCheck(model->num_parameters, sizeof(float));
+        model->v_memory = (float*)callocCheck(model->num_parameters, sizeof(float));
+        printf("  Base optimizer m_memory allocated and zeroed.\n");
+        printf("  Base optimizer v_memory allocated and zeroed.\n");
+
     }
 
-    //for dora parameters
-    if (model->m_memory_dora == NULL && model->num_parameters_dora > 0) {
-        model->m_memory_dora = (float*)calloc(model->num_parameters_dora, sizeof(float));
-        model->v_memory_dora = (float*)calloc(model->num_parameters_dora, sizeof(float));
-        assert(model->m_memory_dora != NULL && model->v_memory_dora != NULL);
-        printf("Warning: DORA optimizer states allocated in gpt2_update.\n");
-    }
-
-    if (model->num_parameters_dora == 0) {
-        fprintf(stderr, "Warning: Trying to update DORA params, but none seem allocated.\n");
-    }
-
+    // Calculate sizes needed for DORA + GQA bias states
     size_t L = model->config.num_layers;
     size_t C = model->config.channels;
     size_t NH = model->config.num_heads;
     size_t NKVH = model->config.num_kv_heads;
-    size_t HS = C / NH;
-    size_t q_dim = NH * HS;           // Dimension for Q projections
-    size_t kv_dim = NKVH * HS;        // Dimension for K and V projections (GQA)
+    size_t HS = (NH > 0) ? C / NH : 0;
+    size_t q_dim = NH * HS;
+    size_t kv_dim = NKVH * HS;
     size_t OC_qkv_gqa = q_dim + 2 * kv_dim;
-    size_t OC_fc  = 4 * C;           // Hidden dimension for FFN.
+    size_t OC_fc = 4 * C;
     size_t r = model->dora_rank;
 
-    size_t size_qkv_A_layer = r * C;         // A maps from C
+    size_t size_qkv_A_layer = r * C;
     size_t size_qkv_B_layer = OC_qkv_gqa * r;
     size_t size_qkv_m_layer = OC_qkv_gqa;
-
+    size_t size_qkv_bias_layer_gqa = OC_qkv_gqa; // Size for GQA bias
     size_t size_att_A_layer = r * C;
     size_t size_att_B_layer = C * r;
     size_t size_att_m_layer = C;
-
     size_t size_fc_A_layer  = r * C;
     size_t size_fc_B_layer  = OC_fc * r;
     size_t size_fc_m_layer  = OC_fc;
-
     size_t size_fcp_A_layer = r * OC_fc;
     size_t size_fcp_B_layer = C * r;
     size_t size_fcp_m_layer = C;
 
+    // Total size needed for ALL trainable DORA-related components (A, B, m, qkvb_gqa)
+    size_t total_dora_optim_states_size = L * (
+        (size_qkv_A_layer + size_qkv_B_layer + size_qkv_m_layer + size_qkv_bias_layer_gqa) +
+        (size_att_A_layer + size_att_B_layer + size_att_m_layer) +
+        (size_fc_A_layer  + size_fc_B_layer  + size_fc_m_layer) +
+        (size_fcp_A_layer + size_fcp_B_layer + size_fcp_m_layer)
+    );
 
-    //offsets with the flat DORA arrays
-    size_t current_dora_offset = 0;
+    if (model->m_memory_dora == NULL && total_dora_optim_states_size > 0) {
+        printf("Allocating DORA (+GQA bias) optimizer states (m/v), total elements per state: %zu\n", total_dora_optim_states_size);
+        model->m_memory_dora = (float*)callocCheck(total_dora_optim_states_size, sizeof(float));
+        model->v_memory_dora = (float*)callocCheck(total_dora_optim_states_size, sizeof(float));
+        printf("  DORA optimizer m_memory_dora zeroed.\n");
+        printf("  DORA optimizer v_memory_dora zeroed.\n");
+    }
 
-    //QKV offsets
-    size_t dora_offset_qkv_A = current_dora_offset;
-    current_dora_offset += L * size_qkv_A_layer;
-    size_t dora_offset_qkv_B = current_dora_offset;
-    current_dora_offset += L * size_qkv_B_layer;
-    size_t dora_offset_qkv_m = current_dora_offset;
-    current_dora_offset += L * size_qkv_m_layer;
-
-    //AttProj offsets
-    size_t dora_offset_att_A = current_dora_offset;
-    current_dora_offset += L * size_att_A_layer;
-    size_t dora_offset_att_B = current_dora_offset;
-    current_dora_offset += L * size_att_B_layer;
-    size_t dora_offset_att_m = current_dora_offset;
-    current_dora_offset += L * size_att_m_layer;
-    // FC Offsets.
-    size_t dora_offset_fc_A = current_dora_offset;
-    current_dora_offset += L * size_fc_A_layer;
-    size_t dora_offset_fc_B = current_dora_offset;
-    current_dora_offset += L * size_fc_B_layer;
-    size_t dora_offset_fc_m = current_dora_offset;
-    current_dora_offset += L * size_fc_m_layer;
-    // FCProj Offsets.
-    size_t dora_offset_fcp_A = current_dora_offset;
-    current_dora_offset += L * size_fcp_A_layer;
-    size_t dora_offset_fcp_B = current_dora_offset;
-    current_dora_offset += L * size_fcp_B_layer;
-    size_t dora_offset_fcp_m = current_dora_offset;
+    if (model->num_parameters_dora > 0 && (model->m_memory_dora == NULL || model->v_memory_dora == NULL)) {
+         fprintf(stderr, "ERROR: DORA optimizer states are NULL despite num_parameters_dora > 0.\n");
+         exit(EXIT_FAILURE);
+    }
+    if (model->params.qkvb_gqa == NULL) {
+         fprintf(stderr, "ERROR: model->params.qkvb_gqa is NULL in gpt2_update (should be allocated).\n");
+         exit(EXIT_FAILURE);
+     }
+     if (model->grads_dora.qkvb_gqa == NULL) {
+          fprintf(stderr, "ERROR: model->grads_dora.qkvb_gqa is NULL in gpt2_update (should be allocated and pointed).\n");
+          exit(EXIT_FAILURE);
+     }
 
 
+    size_t current_dora_optim_offset = 0;
+    // QKV A, B, m offsets
+    size_t dora_offset_optim_qkv_A = current_dora_optim_offset;
+    current_dora_optim_offset += L * size_qkv_A_layer;
+    size_t dora_offset_optim_qkv_B = current_dora_optim_offset;
+    current_dora_optim_offset += L * size_qkv_B_layer;
+    size_t dora_offset_optim_qkv_m = current_dora_optim_offset;
+    current_dora_optim_offset += L * size_qkv_m_layer;
+    // QKV GQA Bias offset
+    size_t dora_offset_optim_qkvb_gqa = current_dora_optim_offset;
+    current_dora_optim_offset += L * size_qkv_bias_layer_gqa;
+    // AttProj offsets
+    size_t dora_offset_optim_att_A = current_dora_optim_offset;
+    current_dora_optim_offset += L * size_att_A_layer;
+    size_t dora_offset_optim_att_B = current_dora_optim_offset;
+    current_dora_optim_offset += L * size_att_B_layer;
+    size_t dora_offset_optim_att_m = current_dora_optim_offset;
+    current_dora_optim_offset += L * size_att_m_layer;
+    // FC offsets
+    size_t dora_offset_optim_fc_A = current_dora_optim_offset;
+    current_dora_optim_offset += L * size_fc_A_layer;
+    size_t dora_offset_optim_fc_B = current_dora_optim_offset;
+    current_dora_optim_offset += L * size_fc_B_layer;
+    size_t dora_offset_optim_fc_m = current_dora_optim_offset;
+    current_dora_optim_offset += L * size_fc_m_layer;
+    // FCProj offsets
+    size_t dora_offset_optim_fcp_A = current_dora_optim_offset;
+    current_dora_optim_offset += L * size_fcp_A_layer;
+    size_t dora_offset_optim_fcp_B = current_dora_optim_offset;
+    current_dora_optim_offset += L * size_fcp_B_layer;
+    size_t dora_offset_optim_fcp_m = current_dora_optim_offset;
+
+    // AdamW bias correction terms
     float beta1_correction = 1.0f - powf(beta1, t);
     float beta2_correction = 1.0f - powf(beta2, t);
 
@@ -2267,94 +2363,103 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2,
     for (int j = 0; j < NUM_PARAMETER_TENSORS; j++) {
         size_t num_param_tensor = model->param_sizes[j];
 
-        //best part of this entire project
-        // skip all frozen base weights
-        // 4-> qkvw, 6-> attprojw, 10-> fcw, 12-> fcprojw
-        if (j == 4 || j == 6 || j == 10 || j == 12) {
-
+        if (j == 4 || j == 6 || j == 10 || j == 12 || j == 5) {
             current_base_offset += num_param_tensor;
             continue;
         }
 
-
+        // Pointers for current base parameter tensor
         float* param_ptr = model->params_memory + current_base_offset;
         float* grad_ptr  = model->grads_memory + current_base_offset;
         float* m_ptr     = model->m_memory + current_base_offset;
         float* v_ptr     = model->v_memory + current_base_offset;
 
         float current_weight_decay = weight_decay;
-        //determine weight decay
-        if (j == 0 // wte
-            || j == 1 // wpe
-            || j == 2 || j == 3 //ln1w,ln1b
-            || j == 5 || j == 7 || // qkvb, attprojb
-            j == 8 || j == 9 // ln2w, ln2b
-            || j == 11 || j == 13 //fcb, fcprojb
-            || j == 14 || j == 15) { // lnfw, lnfb
+        // Indices for biases, norms, embeddings: 0(wte), 1(wpe), 2(ln1w), 3(ln1b),
+        // 5(qkvb - skipped anyway), 7(attprojb), 8(ln2w), 9(ln2b),
+        // 11(fcb), 13(fcprojb), 14(lnfw), 15(lnfb)
+        if (j == 0 || j == 1 || j == 2 || j == 3 || j == 5 || j == 7 || j == 8 || j == 9 || j == 11 || j == 13 || j == 14 || j == 15) {
             current_weight_decay = 0.0f;
         }
 
+        // Apply AdamW update
         #pragma omp parallel for
         for (size_t i = 0; i < num_param_tensor; i++) {
             float param = param_ptr[i];
             float grad  = grad_ptr[i];
+            // Update moments
             float m_val = beta1 * m_ptr[i] + (1.0f - beta1) * grad;
             float v_val = beta2 * v_ptr[i] + (1.0f - beta2) * grad * grad;
             m_ptr[i] = m_val;
             v_ptr[i] = v_val;
+            // Bias correction
             float m_hat = m_val / beta1_correction;
             float v_hat = v_val / beta2_correction;
+            // Update parameters
             param_ptr[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + current_weight_decay * param);
         }
         current_base_offset += num_param_tensor;
     }
 
-    if (model->num_parameters_dora > 0) {
+    // Trainable DORA Parameters (A, B, m) and qkvb_gqa
+    if (model->m_memory_dora != NULL) {
         #pragma omp parallel for
         for (int l = 0; l < L; ++l) {
             {
-                // Parameter pointers
                 float* pA = model->params.qkvw_A + l * size_qkv_A_layer;
-                float* pB = model->params.qkvw_B + l * size_qkv_B_layer; // GQA size
-                float* pm = model->params.qkvw_m + l * size_qkv_m_layer; // GQA size
-                // Gradient pointers
+                float* pB = model->params.qkvw_B + l * size_qkv_B_layer;
+                float* pm = model->params.qkvw_m + l * size_qkv_m_layer;
                 float* gA = model->grads_dora.qkvw_A + l * size_qkv_A_layer;
-                float* gB = model->grads_dora.qkvw_B + l * size_qkv_B_layer; // GQA size
-                float* gm = model->grads_dora.qkvw_m + l * size_qkv_m_layer; // GQA size
-                // Optimizer state pointers (using calculated GQA offsets)
-                float* mA = model->m_memory_dora + dora_offset_qkv_A + l * size_qkv_A_layer;
-                float* vA = model->v_memory_dora + dora_offset_qkv_A + l * size_qkv_A_layer;
-                float* mB = model->m_memory_dora + dora_offset_qkv_B + l * size_qkv_B_layer; // GQA offset/size
-                float* vB = model->v_memory_dora + dora_offset_qkv_B + l * size_qkv_B_layer; // GQA offset/size
-                float* mm = model->m_memory_dora + dora_offset_qkv_m + l * size_qkv_m_layer; // GQA offset/size
-                float* vm = model->v_memory_dora + dora_offset_qkv_m + l * size_qkv_m_layer; // GQA offset/size
+                float* gB = model->grads_dora.qkvw_B + l * size_qkv_B_layer;
+                float* gm = model->grads_dora.qkvw_m + l * size_qkv_m_layer;
+                float* mA = model->m_memory_dora + dora_offset_optim_qkv_A + l * size_qkv_A_layer;
+                float* vA = model->v_memory_dora + dora_offset_optim_qkv_A + l * size_qkv_A_layer;
+                float* mB = model->m_memory_dora + dora_offset_optim_qkv_B + l * size_qkv_B_layer;
+                float* vB = model->v_memory_dora + dora_offset_optim_qkv_B + l * size_qkv_B_layer;
+                float* mm = model->m_memory_dora + dora_offset_optim_qkv_m + l * size_qkv_m_layer;
+                float* vm = model->v_memory_dora + dora_offset_optim_qkv_m + l * size_qkv_m_layer;
 
-                // Update qkvw_A (size: r * C)
                 for (size_t i = 0; i < size_qkv_A_layer; ++i) {
                     float param = pA[i]; float grad = gA[i];
                     float m_val = beta1 * mA[i] + (1.f - beta1) * grad;
                     float v_val = beta2 * vA[i] + (1.f - beta2) * grad * grad;
                     mA[i] = m_val; vA[i] = v_val;
                     float m_hat = m_val / beta1_correction; float v_hat = v_val / beta2_correction;
-                    pA[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param); // Apply WD to A/B
+                    pA[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param);
                 }
-                // Update qkvw_B (size: OC_qkv_gqa * r)
                 for (size_t i = 0; i < size_qkv_B_layer; ++i) {
                     float param = pB[i]; float grad = gB[i];
                     float m_val = beta1 * mB[i] + (1.f - beta1) * grad;
                     float v_val = beta2 * vB[i] + (1.f - beta2) * grad * grad;
                     mB[i] = m_val; vB[i] = v_val;
                     float m_hat = m_val / beta1_correction; float v_hat = v_val / beta2_correction;
-                    pB[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param); // Apply WD to A/B
+                    pB[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param);
                 }
-                // Update qkvw_m (size: OC_qkv_gqa) - NO Weight Decay on magnitude
                 for (size_t i = 0; i < size_qkv_m_layer; ++i) {
-                    float grad = gm[i]; // param = pm[i]; (not needed for WD=0)
+                    float grad = gm[i];
                     float m_val = beta1 * mm[i] + (1.f - beta1) * grad;
                     float v_val = beta2 * vm[i] + (1.f - beta2) * grad * grad;
                     mm[i] = m_val; vm[i] = v_val;
                     float m_hat = m_val / beta1_correction; float v_hat = v_val / beta2_correction;
-                    pm[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps)); // No WD term
+                    pm[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps));
+                }
+            }
+
+            {
+                float* p_bias = model->params.qkvb_gqa + l * size_qkv_bias_layer_gqa;
+                float* g_bias = model->grads_dora.qkvb_gqa + l * size_qkv_bias_layer_gqa;
+                float* m_bias = model->m_memory_dora + dora_offset_optim_qkvb_gqa + l * size_qkv_bias_layer_gqa;
+                float* v_bias = model->v_memory_dora + dora_offset_optim_qkvb_gqa + l * size_qkv_bias_layer_gqa;
+
+                for (size_t i = 0; i < size_qkv_bias_layer_gqa; ++i) {
+                    float grad = g_bias[i];
+                    float m_val = beta1 * m_bias[i] + (1.f - beta1) * grad;
+                    float v_val = beta2 * v_bias[i] + (1.f - beta2) * grad * grad;
+                    m_bias[i] = m_val;
+                    v_bias[i] = v_val;
+                    float m_hat = m_val / beta1_correction;
+                    float v_hat = v_val / beta2_correction;
+                    p_bias[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps)); // No WD
                 }
             }
 
@@ -2365,15 +2470,37 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2,
                 float* gB = model->grads_dora.attprojw_B + l * size_att_B_layer;
                 float* pm = model->params.attprojw_m + l * size_att_m_layer;
                 float* gm = model->grads_dora.attprojw_m + l * size_att_m_layer;
-                float* mA = model->m_memory_dora + dora_offset_att_A + l * size_att_A_layer;
-                float* vA = model->v_memory_dora + dora_offset_att_A + l * size_att_A_layer;
-                float* mB = model->m_memory_dora + dora_offset_att_B + l * size_att_B_layer;
-                float* vB = model->v_memory_dora + dora_offset_att_B + l * size_att_B_layer;
-                float* mm = model->m_memory_dora + dora_offset_att_m + l * size_att_m_layer;
-                float* vm = model->v_memory_dora + dora_offset_att_m + l * size_att_m_layer;
-                for (size_t i = 0; i < size_att_A_layer; ++i) { /* AdamW update for A */ }
-                for (size_t i = 0; i < size_att_B_layer; ++i) { /* AdamW update for B */ }
-                for (size_t i = 0; i < size_att_m_layer; ++i) { /* AdamW update for m (no WD) */ }
+                float* mA = model->m_memory_dora + dora_offset_optim_att_A + l * size_att_A_layer;
+                float* vA = model->v_memory_dora + dora_offset_optim_att_A + l * size_att_A_layer;
+                float* mB = model->m_memory_dora + dora_offset_optim_att_B + l * size_att_B_layer;
+                float* vB = model->v_memory_dora + dora_offset_optim_att_B + l * size_att_B_layer;
+                float* mm = model->m_memory_dora + dora_offset_optim_att_m + l * size_att_m_layer;
+                float* vm = model->v_memory_dora + dora_offset_optim_att_m + l * size_att_m_layer;
+
+                 for (size_t i = 0; i < size_att_A_layer; ++i) {
+                    float param = pA[i]; float grad = gA[i];
+                    float m_val = beta1 * mA[i] + (1.f - beta1) * grad;
+                    float v_val = beta2 * vA[i] + (1.f - beta2) * grad * grad;
+                    mA[i] = m_val; vA[i] = v_val;
+                    float m_hat = m_val / beta1_correction; float v_hat = v_val / beta2_correction;
+                    pA[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param);
+                 }
+                 for (size_t i = 0; i < size_att_B_layer; ++i) {
+                    float param = pB[i]; float grad = gB[i];
+                    float m_val = beta1 * mB[i] + (1.f - beta1) * grad;
+                    float v_val = beta2 * vB[i] + (1.f - beta2) * grad * grad;
+                    mB[i] = m_val; vB[i] = v_val;
+                    float m_hat = m_val / beta1_correction; float v_hat = v_val / beta2_correction;
+                    pB[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param);
+                 }
+                 for (size_t i = 0; i < size_att_m_layer; ++i) {
+                    float grad = gm[i];
+                    float m_val = beta1 * mm[i] + (1.f - beta1) * grad;
+                    float v_val = beta2 * vm[i] + (1.f - beta2) * grad * grad;
+                    mm[i] = m_val; vm[i] = v_val;
+                    float m_hat = m_val / beta1_correction; float v_hat = v_val / beta2_correction;
+                    pm[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps));
+                 }
             }
 
             {
@@ -2383,15 +2510,37 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2,
                  float* gB = model->grads_dora.fcw_B + l * size_fc_B_layer;
                  float* pm = model->params.fcw_m + l * size_fc_m_layer;
                  float* gm = model->grads_dora.fcw_m + l * size_fc_m_layer;
-                 float* mA = model->m_memory_dora + dora_offset_fc_A + l * size_fc_A_layer;
-                 float* vA = model->v_memory_dora + dora_offset_fc_A + l * size_fc_A_layer;
-                 float* mB = model->m_memory_dora + dora_offset_fc_B + l * size_fc_B_layer;
-                 float* vB = model->v_memory_dora + dora_offset_fc_B + l * size_fc_B_layer;
-                 float* mm = model->m_memory_dora + dora_offset_fc_m + l * size_fc_m_layer;
-                 float* vm = model->v_memory_dora + dora_offset_fc_m + l * size_fc_m_layer;
-                for (size_t i = 0; i < size_fc_A_layer; ++i) { /* AdamW update for A */ }
-                for (size_t i = 0; i < size_fc_B_layer; ++i) { /* AdamW update for B */ }
-                for (size_t i = 0; i < size_fc_m_layer; ++i) { /* AdamW update for m (no WD) */ }
+                 float* mA = model->m_memory_dora + dora_offset_optim_fc_A + l * size_fc_A_layer;
+                 float* vA = model->v_memory_dora + dora_offset_optim_fc_A + l * size_fc_A_layer;
+                 float* mB = model->m_memory_dora + dora_offset_optim_fc_B + l * size_fc_B_layer;
+                 float* vB = model->v_memory_dora + dora_offset_optim_fc_B + l * size_fc_B_layer;
+                 float* mm = model->m_memory_dora + dora_offset_optim_fc_m + l * size_fc_m_layer;
+                 float* vm = model->v_memory_dora + dora_offset_optim_fc_m + l * size_fc_m_layer;
+
+                 for (size_t i = 0; i < size_fc_A_layer; ++i) {
+                    float param = pA[i]; float grad = gA[i];
+                    float m_val = beta1 * mA[i] + (1.f - beta1) * grad;
+                    float v_val = beta2 * vA[i] + (1.f - beta2) * grad * grad;
+                    mA[i] = m_val; vA[i] = v_val;
+                    float m_hat = m_val / beta1_correction; float v_hat = v_val / beta2_correction;
+                    pA[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param);
+                 }
+                 for (size_t i = 0; i < size_fc_B_layer; ++i) {
+                     float param = pB[i]; float grad = gB[i];
+                     float m_val = beta1 * mB[i] + (1.f - beta1) * grad;
+                     float v_val = beta2 * vB[i] + (1.f - beta2) * grad * grad;
+                     mB[i] = m_val; vB[i] = v_val;
+                     float m_hat = m_val / beta1_correction; float v_hat = v_val / beta2_correction;
+                     pB[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param);
+                 }
+                 for (size_t i = 0; i < size_fc_m_layer; ++i) {
+                     float grad = gm[i];
+                     float m_val = beta1 * mm[i] + (1.f - beta1) * grad;
+                     float v_val = beta2 * vm[i] + (1.f - beta2) * grad * grad;
+                     mm[i] = m_val; vm[i] = v_val;
+                     float m_hat = m_val / beta1_correction; float v_hat = v_val / beta2_correction;
+                     pm[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps));
+                 }
             }
 
             {
@@ -2401,20 +2550,40 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2,
                  float* gB = model->grads_dora.fcprojw_B + l * size_fcp_B_layer;
                  float* pm = model->params.fcprojw_m + l * size_fcp_m_layer;
                  float* gm = model->grads_dora.fcprojw_m + l * size_fcp_m_layer;
-                 float* mA = model->m_memory_dora + dora_offset_fcp_A + l * size_fcp_A_layer;
-                 float* vA = model->v_memory_dora + dora_offset_fcp_A + l * size_fcp_A_layer;
-                 float* mB = model->m_memory_dora + dora_offset_fcp_B + l * size_fcp_B_layer;
-                 float* vB = model->v_memory_dora + dora_offset_fcp_B + l * size_fcp_B_layer;
-                 float* mm = model->m_memory_dora + dora_offset_fcp_m + l * size_fcp_m_layer;
-                 float* vm = model->v_memory_dora + dora_offset_fcp_m + l * size_fcp_m_layer;
-                for (size_t i = 0; i < size_fcp_A_layer; ++i) { /* AdamW update for A */ }
-                for (size_t i = 0; i < size_fcp_B_layer; ++i) { /* AdamW update for B */ }
-                for (size_t i = 0; i < size_fcp_m_layer; ++i) { /* AdamW update for m (no WD) */ }
+                 float* mA = model->m_memory_dora + dora_offset_optim_fcp_A + l * size_fcp_A_layer;
+                 float* vA = model->v_memory_dora + dora_offset_optim_fcp_A + l * size_fcp_A_layer;
+                 float* mB = model->m_memory_dora + dora_offset_optim_fcp_B + l * size_fcp_B_layer;
+                 float* vB = model->v_memory_dora + dora_offset_optim_fcp_B + l * size_fcp_B_layer;
+                 float* mm = model->m_memory_dora + dora_offset_optim_fcp_m + l * size_fcp_m_layer;
+                 float* vm = model->v_memory_dora + dora_offset_optim_fcp_m + l * size_fcp_m_layer;
+
+                 for (size_t i = 0; i < size_fcp_A_layer; ++i) {
+                    float param = pA[i]; float grad = gA[i];
+                    float m_val = beta1 * mA[i] + (1.f - beta1) * grad;
+                    float v_val = beta2 * vA[i] + (1.f - beta2) * grad * grad;
+                    mA[i] = m_val; vA[i] = v_val;
+                    float m_hat = m_val / beta1_correction; float v_hat = v_val / beta2_correction;
+                    pA[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param);
+                 }
+                 for (size_t i = 0; i < size_fcp_B_layer; ++i) {
+                     float param = pB[i]; float grad = gB[i];
+                     float m_val = beta1 * mB[i] + (1.f - beta1) * grad;
+                     float v_val = beta2 * vB[i] + (1.f - beta2) * grad * grad;
+                     mB[i] = m_val; vB[i] = v_val;
+                     float m_hat = m_val / beta1_correction; float v_hat = v_val / beta2_correction;
+                     pB[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps) + weight_decay * param);
+                 }
+                 for (size_t i = 0; i < size_fcp_m_layer; ++i) {
+                     float grad = gm[i];
+                     float m_val = beta1 * mm[i] + (1.f - beta1) * grad;
+                     float v_val = beta2 * vm[i] + (1.f - beta2) * grad * grad;
+                     mm[i] = m_val; vm[i] = v_val;
+                     float m_hat = m_val / beta1_correction; float v_hat = v_val / beta2_correction;
+                     pm[i] -= learning_rate * (m_hat / (sqrtf(v_hat) + eps));
+                 }
             }
         }
-
     }
-
 }
 
 void gpt2_free(GPT2 *model) {
@@ -2435,22 +2604,347 @@ void gpt2_free(GPT2 *model) {
     if(model->dora_temp_storage != NULL) { free(model->dora_temp_storage); }
 }
 
+void clip_gradients(GPT2 *model, float max_norm) {
+    if (model->grads_memory == NULL || (model->num_parameters_dora > 0 && model->grads_memory_dora == NULL)) {
+        return;
+    }
+
+    double global_norm_sq = 0.0;
+    size_t current_base_offset = 0;
+
+    for (int j = 0; j < NUM_PARAMETER_TENSORS; j++) {
+        size_t num_param_tensor = model->param_sizes[j];
+
+        if (j == 4 || j == 6 || j == 10 || j == 12 || j == 5) {
+            current_base_offset += num_param_tensor;
+            continue;
+        }
+
+        if (model->grads_memory == NULL) continue;
+        float* grad_ptr = model->grads_memory + current_base_offset;
+        for (size_t i = 0; i < num_param_tensor; ++i) {
+            global_norm_sq += (double)grad_ptr[i] * grad_ptr[i];
+        }
+        current_base_offset += num_param_tensor;
+    }
+
+     size_t L = model->config.num_layers;
+     size_t C = model->config.channels;
+     size_t NH = model->config.num_heads;
+     size_t NKVH = model->config.num_kv_heads;
+     size_t HS = (NH > 0) ? C / NH : 0;
+     size_t q_dim = NH * HS;
+     size_t kv_dim = NKVH * HS;
+     size_t OC_qkv_gqa = q_dim + 2 * kv_dim;
+     size_t OC_fc = 4 * C;
+     size_t r = model->dora_rank;
+     size_t size_qkv_A_layer = r * C;
+     size_t size_qkv_B_layer = OC_qkv_gqa * r;
+     size_t size_qkv_m_layer = OC_qkv_gqa;
+     size_t size_qkv_bias_layer_gqa = OC_qkv_gqa;
+     size_t size_att_A_layer = r * C;
+     size_t size_att_B_layer = C * r;
+     size_t size_att_m_layer = C;
+     size_t size_fc_A_layer  = r * C;
+     size_t size_fc_B_layer  = OC_fc * r;
+     size_t size_fc_m_layer  = OC_fc;
+     size_t size_fcp_A_layer = r * OC_fc;
+     size_t size_fcp_B_layer = C * r;
+     size_t size_fcp_m_layer = C;
+
+     size_t total_dora_grads_size_elements = L * (size_qkv_A_layer + size_qkv_B_layer + size_qkv_m_layer + size_qkv_bias_layer_gqa + size_att_A_layer + size_att_B_layer + size_att_m_layer + size_fc_A_layer  + size_fc_B_layer  + size_fc_m_layer + size_fcp_A_layer + size_fcp_B_layer + size_fcp_m_layer);
+
+    if (model->grads_memory_dora != NULL && total_dora_grads_size_elements > 0) {
+         for (size_t i = 0; i < total_dora_grads_size_elements; ++i) {
+             global_norm_sq += (double)model->grads_memory_dora[i] * model->grads_memory_dora[i];
+         }
+    }
+
+    float global_norm = sqrtf((float)global_norm_sq);
+
+    if (global_norm > max_norm) {
+        float scale = max_norm / (global_norm + 1e-6f);
+
+        current_base_offset = 0;
+        for (int j = 0; j < NUM_PARAMETER_TENSORS; j++) {
+             size_t num_param_tensor = model->param_sizes[j];
+             if (j == 4 || j == 6 || j == 10 || j == 12 || j == 5) {
+                 current_base_offset += num_param_tensor;
+                 continue;
+             }
+             if (model->grads_memory == NULL) continue;
+             float* grad_ptr = model->grads_memory + current_base_offset;
+             #pragma omp parallel for
+             for (size_t i = 0; i < num_param_tensor; ++i) {
+                 grad_ptr[i] *= scale;
+             }
+             current_base_offset += num_param_tensor;
+        }
+
+         if (model->grads_memory_dora != NULL && total_dora_grads_size_elements > 0) {
+              #pragma omp parallel for
+              for (size_t i = 0; i < total_dora_grads_size_elements; ++i) {
+                  model->grads_memory_dora[i] *= scale;
+              }
+         }
+    }
+}
+
+EvalResult evaluate_model_finetune(GPT2 *model,
+                                   DataLoader *train_loader,
+                                   DataLoader *val_loader,
+                                   Tokenizer *tokenizer,
+                                   const EvalConfig *config,
+                                   size_t current_r,
+                                   size_t current_gqa_groups)
+{
+    EvalResult result = {0};
+    struct timespec start, end, step_start, step_end;
+    double total_train_step_time_s = 0.0;
+    unsigned long long rng_state = 1337 + current_r + current_gqa_groups; // Seed RNG for sampling
+
+    printf("\n--- Starting Fine-Tuning & Eval Run: DoRA r=%zu, GQA G=%zu ---\n", current_r, current_gqa_groups);
+    printf("  Config: Steps=%d, LR=%.2e, B=%d, T=%d\n",
+           config->num_finetune_steps, config->learning_rate, config->B, config->T);
+
+    gpt2_zero_grad(model);
+    printf("  Optimizer states zeroed (or will be allocated/zeroed on first update).\n");
+    printf("  Initial gradients zeroed.\n");
+
+    printf("Starting fine-tuning loop for %d steps...\n", config->num_finetune_steps);
+    dataloader_reset(train_loader);
+    double total_train_loss = 0.0;
+    int actual_train_steps = 0;
+
+    for (int step = 0; step < config->num_finetune_steps; ++step) {
+        clock_gettime(CLOCK_MONOTONIC, &step_start);
+
+        dataloader_next_batch(train_loader);
+
+        gpt2_forward(model, train_loader->inputs, train_loader->targets, config->B, config->T);
+
+        if (model->mean_loss < 0 || !isfinite(model->mean_loss)) {
+            fprintf(stderr, "Warning: Invalid loss %.4f during training step %d. Skipping backward/update.\n", model->mean_loss, step + 1);
+             clock_gettime(CLOCK_MONOTONIC, &step_end); // Still measure time even if skipping update
+             total_train_step_time_s += (step_end.tv_sec - step_start.tv_sec) + (step_end.tv_nsec - step_start.tv_nsec) / 1e9;
+             continue;
+        }
+
+        if (step == 0 || (step + 1) % 10 == 0 || step == config->num_finetune_steps - 1) {
+             printf("  Step %4d/%d | Train Loss: %.4f\n",
+                    step + 1, config->num_finetune_steps, model->mean_loss);
+        }
+
+        total_train_loss += model->mean_loss;
+        actual_train_steps++;
+
+        gpt2_zero_grad(model);
+        gpt2_backward(model);
+        clip_gradients(model, 1.0f);
+        gpt2_update(model, config->learning_rate, config->beta1, config->beta2,
+                    config->eps, config->weight_decay, actual_train_steps);
+
+        clock_gettime(CLOCK_MONOTONIC, &step_end);
+        total_train_step_time_s += (step_end.tv_sec - step_start.tv_sec) + (step_end.tv_nsec - step_start.tv_nsec) / 1e9;
+    }
+
+    if (actual_train_steps > 0) {
+        result.avg_train_loss = (float)(total_train_loss / actual_train_steps);
+        result.time_per_train_step_ms = (total_train_step_time_s / actual_train_steps) * 1000.0;
+        printf("Fine-tuning complete (%d valid steps).\n", actual_train_steps);
+        printf("  Average Train Loss: %.4f\n", result.avg_train_loss);
+        printf("  Avg Time per Training Step: %.4f ms\n", result.time_per_train_step_ms);
+    } else {
+        printf("Warning: No valid training steps completed.\n");
+        result.avg_train_loss = -1.0f;
+        result.time_per_train_step_ms = -1.0;
+    }
+
+    printf("Starting validation (%d batches)...\n", config->val_num_batches);
+    float val_loss = 0.0f;
+    int batches_evaluated = 0;
+    dataloader_reset(val_loader);
+
+    for (int i = 0; i < config->val_num_batches; i++) {
+        dataloader_next_batch(val_loader);
+        gpt2_forward(model, val_loader->inputs, val_loader->targets, config->B, config->T);
+
+        if (model->mean_loss < 0 || !isfinite(model->mean_loss)) {
+             fprintf(stderr, "Warning: Invalid loss %.4f during validation batch %d.\n", model->mean_loss, i);
+             continue;
+        }
+
+        printf("  Val Batch %3d/%d | Val Loss: %.4f\n",
+               i + 1, config->val_num_batches, model->mean_loss);
+
+        val_loss += model->mean_loss;
+        batches_evaluated++;
+    }
+    printf("Validation complete.\n");
+
+    if (batches_evaluated > 0) {
+        result.final_val_loss = val_loss / batches_evaluated;
+        printf("  Average Final Validation Loss: %.4f (over %d valid batches)\n", result.final_val_loss, batches_evaluated);
+    } else {
+         printf("  Warning: No validation batches evaluated successfully.\n");
+         result.final_val_loss = -1.0f;
+    }
+
+    printf("Generating Sample & Measuring Inference Speed (%d tokens)...\n", config->gen_tokens_for_qualitative);
+    int* gen_tokens = (int*)mallocCheck(config->B * config->T * sizeof(int));
+    int eot_token = tokenizer->eot_token;
+    for(int i=0; i<config->B * config->T; ++i) gen_tokens[i] = eot_token;
+    int num_prompt_tokens = 1;
+    int generated_count = 0;
+    double total_gen_time_s = 0.0;
+
+    printf("Generated Text (b=0): ");
+    fflush(stdout);
+
+    for (int t = 0; t < config->gen_tokens_for_qualitative; t++) {
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        int current_T_input = (num_prompt_tokens < config->T) ? num_prompt_tokens : config->T;
+        int input_offset = (num_prompt_tokens <= config->T) ? 0 : num_prompt_tokens - config->T;
+
+        gpt2_forward(model, gen_tokens + input_offset, NULL, config->B, config->T);
+
+        int logits_offset = (/*b=*/0 * config->T + (current_T_input - 1)) * model->config.padded_vocab_size;
+        float* logits = model->acts.logits + logits_offset;
+
+        float coin = random_f32(&rng_state);
+        int next_token = sample_softmax(logits, model->config.vocab_size, coin);
+        generated_count++;
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        total_gen_time_s += (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+
+
+        if (next_token == eot_token) { printf("<EOT>"); fflush(stdout); break; }
+        if (tokenizer->init_ok) { safe_printf(tokenizer_decode(tokenizer, next_token)); }
+        else { printf("%d ", next_token); }
+        fflush(stdout);
+
+        if (num_prompt_tokens < config->T) {
+            gen_tokens[num_prompt_tokens] = next_token;
+        } else {
+            memmove(gen_tokens, gen_tokens + 1, (config->T - 1) * sizeof(int));
+            gen_tokens[config->T - 1] = next_token;
+        }
+        num_prompt_tokens++;
+    }
+    printf("\n");
+    free(gen_tokens);
+
+    if (generated_count > 0) {
+        result.time_per_gen_token_ms = (total_gen_time_s / generated_count) * 1000.0;
+        printf("  Time per Generated Token: %.4f ms\n", result.time_per_gen_token_ms);
+    } else {
+        printf("  Warning: No tokens generated for timing.\n");
+        result.time_per_gen_token_ms = -1.0;
+    }
+
+    result.num_dora_params = model->num_parameters_dora; // A, B, m count
+
+    size_t L_ = model->config.num_layers;
+    size_t C_ = model->config.channels;
+    size_t NH_ = model->config.num_heads;
+    size_t NKVH_ = model->config.num_kv_heads;
+    size_t HS_ = (NH_ > 0) ? C_ / NH_ : 0;
+    size_t q_dim_ = NH_ * HS_;
+    size_t kv_dim_ = NKVH_ * HS_;
+    size_t OC_qkv_gqa_ = q_dim_ + 2 * kv_dim_;
+    size_t OC_fc_ = 4 * C_;
+    size_t r_calc = model->dora_rank;
+
+    size_t size_qkv_A_layer_calc = r_calc * C_;
+    size_t size_qkv_B_layer_calc = OC_qkv_gqa_ * r_calc;
+    size_t size_qkv_m_layer_calc = OC_qkv_gqa_;
+    size_t size_qkv_bias_layer_gqa_calc = OC_qkv_gqa_;
+    size_t size_att_A_layer_calc = r_calc * C_;
+    size_t size_att_B_layer_calc = C_ * r_calc;
+    size_t size_att_m_layer_calc = C_;
+    size_t size_fc_A_layer_calc  = r_calc * C_;
+    size_t size_fc_B_layer_calc  = OC_fc_ * r_calc;
+    size_t size_fc_m_layer_calc  = OC_fc_;
+    size_t size_fcp_A_layer_calc = r_calc * OC_fc_;
+    size_t size_fcp_B_layer_calc = C_ * r_calc;
+    size_t size_fcp_m_layer_calc = C_;
+
+    size_t total_dora_trainable_size = L_ * (
+        (size_qkv_A_layer_calc + size_qkv_B_layer_calc + size_qkv_m_layer_calc + size_qkv_bias_layer_gqa_calc) +
+        (size_att_A_layer_calc + size_att_B_layer_calc + size_att_m_layer_calc) +
+        (size_fc_A_layer_calc  + size_fc_B_layer_calc  + size_fc_m_layer_calc ) +
+        (size_fcp_A_layer_calc + size_fcp_B_layer_calc + size_fcp_m_layer_calc)
+    );
+
+    size_t gqa_qkvw_count = L_ * OC_qkv_gqa_ * C_;
+    size_t gqa_qkvb_count = L_ * OC_qkv_gqa_;
+    size_t base_attprojw_count = L_ * C_ * C_;
+    size_t base_attprojb_count = L_ * C_;
+    size_t base_fcw_count = L_ * OC_fc_ * C_;
+    size_t base_fcb_count = L_ * OC_fc_;
+    size_t base_fcprojw_count = L_ * C_ * OC_fc_;
+    size_t base_fcprojb_count = L_ * C_;
+    size_t wte_size = model->param_sizes[0]; size_t wpe_size = model->param_sizes[1];
+    size_t ln1w_size = model->param_sizes[2]; size_t ln1b_size = model->param_sizes[3];
+    size_t ln2w_size = model->param_sizes[8]; size_t ln2b_size = model->param_sizes[9];
+    size_t lnfw_size = model->param_sizes[14]; size_t lnfb_size = model->param_sizes[15];
+    result.num_base_params = wte_size + wpe_size + ln1w_size + ln1b_size +
+                              gqa_qkvw_count + gqa_qkvb_count + base_attprojw_count + base_attprojb_count +
+                              ln2w_size + ln2b_size + base_fcw_count + base_fcb_count +
+                              base_fcprojw_count + base_fcprojb_count + lnfw_size + lnfb_size;
+
+    size_t frozen_base_weights = gqa_qkvw_count + base_attprojw_count + base_fcw_count + base_fcprojw_count;
+    size_t trainable_base_params_approx = result.num_base_params - frozen_base_weights;
+    if (trainable_base_params_approx > result.num_base_params) trainable_base_params_approx = 0;
+
+    result.num_trainable_params = total_dora_trainable_size + trainable_base_params_approx;
+
+    size_t original_total_params = model->num_parameters;
+    double full_ft_memory_b = (double)original_total_params * sizeof(float) * 3.0;
+    double dora_ft_memory_b = ((double)frozen_base_weights * sizeof(float)) +
+                              ((double)trainable_base_params_approx * sizeof(float) * 3.0) +
+                              ((double)total_dora_trainable_size * sizeof(float) * 3.0);
+
+    result.memory_saved_mb = (full_ft_memory_b > dora_ft_memory_b) ? (full_ft_memory_b - dora_ft_memory_b) / (1024.0 * 1024.0) : 0.0;
+    result.memory_saved_percent = (full_ft_memory_b > 1e-6) ? (result.memory_saved_mb / (full_ft_memory_b / (1024.0 * 1024.0))) * 100.0 : 0.0;
+
+    printf("  [Eval Metrics] DoRA A/B/m Params: %zu\n", result.num_dora_params); // Report A/B/m separately
+    printf("  [Eval Metrics] DoRA+GQA Bias Trainable: %zu\n", total_dora_trainable_size); // Report total DoRA trainable
+    printf("  [Eval Metrics] Base Params (Adapted GQA G=%zu): %zu\n", current_gqa_groups, result.num_base_params);
+    printf("  [Eval Metrics] Total Trainable (Est.): %zu\n", result.num_trainable_params);
+    printf("  [Eval Metrics] Est. Mem Saved vs Full FT: %.2f MB (%.1f%%)\n", result.memory_saved_mb, result.memory_saved_percent);
+    printf("--- Fine-Tuning & Eval Run Complete for r=%zu, G=%zu ---\n", current_r, current_gqa_groups);
+
+    return result;
+}
+
+void log_results(FILE *log_file, size_t r, size_t gqa_groups, const EvalResult *result) {
+    if (log_file == NULL) {
+        fprintf(stderr, "Error: Log file is not open.\n");
+        return;
+    }
+    fprintf(log_file, "%zu,%zu,%.4f,%.4f,%.4f,%.4f,%zu,%zu,%zu,%.2f,%.1f\n",
+            r,
+            gqa_groups,
+            result->avg_train_loss,
+            result->final_val_loss,
+            result->time_per_train_step_ms,
+            result->time_per_gen_token_ms,
+            result->num_dora_params,
+            result->num_base_params,
+            result->num_trainable_params,
+            result->memory_saved_mb,
+            result->memory_saved_percent);
+    fflush(log_file); // Write results immediately
+}
+
+
 #ifndef TESTING
 // if we are TESTING (see test_gpt2.c), we'll skip the int main below
 // ----------------------------------------------------------------------------
 // sampler
-
-unsigned int random_u32(uint64_t *state) {
-    // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
-    *state ^= *state >> 12;
-    *state ^= *state << 25;
-    *state ^= *state >> 27;
-    return (*state * 0x2545F4914F6CDD1Dull) >> 32;
-}
-float random_f32(uint64_t *state) { // random float32 in [0,1)
-    return (random_u32(state) >> 8) / 16777216.0f;
-}
-
 int sample_mult(float* probabilities, int n, float coin) {
     // sample index from probabilities (they must sum to 1!)
     // coin is a random number in [0, 1), usually from random_f32()
@@ -2464,111 +2958,196 @@ int sample_mult(float* probabilities, int n, float coin) {
     return n - 1; // in case of rounding errors
 }
 
-// ----------------------------------------------------------------------------
-// main training loop
-int main() {
 
-    // build the GPT-2 model from a checkpoint
-    GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
-    allocate_and_init_dora(&model, 8);
-    // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
+void gpt2_repoint_parameters(ParameterTensors* params, size_t* param_sizes, float* params_memory) {
+    float** ptrs[] = {
+        &params->wte, &params->wpe, &params->ln1w, &params->ln1b, &params->qkvw,
+        &params->qkvb, &params->attprojw, &params->attprojb, &params->ln2w, &params->ln2b,
+        &params->fcw, &params->fcb, &params->fcprojw, &params->fcprojb, &params->lnfw,
+        &params->lnfb
+    };
+    assert(sizeof(ptrs) / sizeof(ptrs[0]) == NUM_PARAMETER_TENSORS);
+
+    float* params_memory_iterator = params_memory;
+    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        *(ptrs[i]) = params_memory_iterator;
+        params_memory_iterator += param_sizes[i];
+    }
+
+    params->qkvb_gqa = NULL;
+    params->qkvw_A = NULL; params->qkvw_B = NULL; params->qkvw_m = NULL;
+    params->attprojw_A = NULL; params->attprojw_B = NULL; params->attprojw_m = NULL;
+    params->fcw_A = NULL; params->fcw_B = NULL; params->fcw_m = NULL;
+    params->fcprojw_A = NULL; params->fcprojw_B = NULL; params->fcprojw_m = NULL;
+}
+
+// ----------------------------------------------------------------------------
+// Main Function with Evaluation Loop
+int main() {
+    printf("Loading base model template...\n");
+    GPT2 base_model_template;
+    gpt2_build_from_checkpoint(&base_model_template, "gpt2_124M.bin");
+    printf("Base model loaded. Num params: %zu\n", base_model_template.num_parameters);
+
+    printf("Copying base parameter memory...\n");
+    float* pristine_params_memory = (float*)mallocCheck(base_model_template.num_parameters * sizeof(float));
+    memcpy(pristine_params_memory, base_model_template.params_memory, base_model_template.num_parameters * sizeof(float));
+    printf("Base parameter memory copied.\n");
+
+
+    printf("Loading data loaders...\n");
+    int B = 4;
+    int T = 64;
     const char* tiny_stories_train = "dev/data/tinystories/TinyStories_train.bin";
     const char* tiny_stories_val = "dev/data/tinystories/TinyStories_val.bin";
     const char* tiny_shakespeare_train = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* tiny_shakespeare_val = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
-    int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
-    int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
-    DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1);
-    dataloader_init(&val_loader, val_tokens, B, T, 0, 1, 0);
-    printf("train dataset num_batches: %zu\n", train_loader.num_tokens / (B*T));
-    printf("val dataset num_batches: %zu\n", val_loader.num_tokens / (B*T));
-    int val_num_batches = 5;
+    printf("Using data paths: %s, %s\n", train_tokens, val_tokens);
 
-    // build the Tokenizer
+    DataLoader train_loader, val_loader;
+    dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1); // Shuffled
+    dataloader_init(&val_loader, val_tokens, B, T, 0, 1, 0); // Not shuffled
+    printf("Train batches: %zu, Val batches: %zu\n", train_loader.num_tokens / (B*T), val_loader.num_tokens / (B*T));
+
+    printf("Loading tokenizer...\n");
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
+    printf("Tokenizer loaded.\n");
 
-    // some memory for generating samples from the model
-    uint64_t rng_state = 1337;
-    int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
-    const int genT = 64; // number of steps of inference we will do
+    size_t dora_ranks_to_test[] = { 4, 8 };
+    int num_dora_ranks = sizeof(dora_ranks_to_test) / sizeof(dora_ranks_to_test[0]);
 
-    // train
-    struct timespec start, end;
-    for (int step = 0; step <= 100; step++) {
-
-        // once in a while estimate the validation loss
-        if (step % 10 == 0) {
-            float val_loss = 0.0f;
-            dataloader_reset(&val_loader);
-            for (int i = 0; i < val_num_batches; i++) {
-                dataloader_next_batch(&val_loader);
-                gpt2_forward(&model, val_loader.inputs, val_loader.targets, B, T);
-                val_loss += model.mean_loss;
+    size_t gqa_groups_to_test[10];
+    int num_gqa_groups = 0;
+    int base_num_heads = base_model_template.config.num_heads;
+    if (base_num_heads > 0) {
+         gqa_groups_to_test[num_gqa_groups++] = 1;
+         for (size_t g = 2; g <= base_num_heads; g *= 2) {
+            if (base_num_heads % g == 0) {
+                 if (num_gqa_groups < 10) {
+                    gqa_groups_to_test[num_gqa_groups++] = g;
+                 }
             }
-            val_loss /= val_num_batches;
-            printf("val loss %f\n", val_loss);
-        }
+         }
 
-        // once in a while do model inference to print generated text
-        if (step > 0 && step % 20 == 0) {
-            // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
-            for(int i = 0; i < B * T; ++i) {
-                gen_tokens[i] = tokenizer.eot_token;
-            }
-            // now sample from the model autoregressively
-            printf("generating:\n---\n");
-            for (int t = 1; t < genT; t++) {
-                // note that inference is very wasteful here because for each token
-                // we re-calculate the forward pass for all of (B,T) positions from scratch
-                // but the inference here is just for sanity checking anyway
-                // and we can maybe optimize a bit more later, with careful tests
-                gpt2_forward(&model, gen_tokens, NULL, B, T);
-                // furthermore, below we're only using b=0 (i.e. the first row) of all B rows
-                // we're in principle running B "inference streams" in parallel here
-                // but only using position 0
-                // get the Vp-dimensional vector probs[0, t-1, :]
-                float* probs = model.acts.probs + (t-1) * model.config.padded_vocab_size;
-                float coin = random_f32(&rng_state);
-                // note we're only sampling from the first V elements, ignoring padding
-                // (the probabilities in the padded region should be zero anyway)
-                int next_token = sample_mult(probs, model.config.vocab_size, coin);
-                gen_tokens[t] = next_token;
-                // print the generated token, either using the Tokenizer or a fallback
-                if (tokenizer.init_ok) {
-                    const char* token_str = tokenizer_decode(&tokenizer, next_token);
-                    safe_printf(token_str);
-                } else {
-                    // fall back to printing the token id
-                    printf("%d ", next_token);
-                }
-                fflush(stdout);
-            }
-            printf("\n---\n");
-        }
-
-        // do a training step
-        clock_gettime(CLOCK_MONOTONIC, &start);
-        dataloader_next_batch(&train_loader);
-        gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
-        gpt2_zero_grad(&model);
-        gpt2_backward(&model);
-        gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
-        clock_gettime(CLOCK_MONOTONIC, &end);
-        double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-        printf("step %d: train loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_s * 1000);
+         if (gqa_groups_to_test[num_gqa_groups-1] != base_num_heads && num_gqa_groups < 10) {
+             gqa_groups_to_test[num_gqa_groups++] = base_num_heads;
+         }
+    } else {
+        gqa_groups_to_test[num_gqa_groups++] = 1;
+        fprintf(stderr, "Warning: Base model has 0 heads, defaulting GQA groups to 1.\n");
     }
 
-    // free
+
+    printf("Testing %d DoRA ranks and %d GQA Group settings.\n", num_dora_ranks, num_gqa_groups);
+    for(int i=0; i<num_dora_ranks; ++i) printf(" Rank: %zu\n", dora_ranks_to_test[i]);
+    for(int i=0; i<num_gqa_groups; ++i) printf(" GQA Groups: %zu\n", gqa_groups_to_test[i]);
+
+
+    EvalConfig config_template = {
+        .checkpoint_path = "gpt2_124M.bin",
+        .tokenizer_path = "gpt2_tokenizer.bin",
+        .train_loader_path = train_tokens,
+        .val_loader_path = val_tokens,
+        .log_file_path = "hyperparam_evaluation_log.csv",
+        .B = B, .T = T,
+        .num_finetune_steps = 60,
+        .val_num_batches = 20,
+        .gen_tokens_for_qualitative = 64,
+        .learning_rate = 1e-4f,
+        .beta1 = 0.9f, .beta2 = 0.99f, .eps = 1e-8f,
+        .weight_decay = 0.01f
+    };
+
+
+    printf("Opening log file: %s\n", config_template.log_file_path);
+    FILE *log_file = fopen(config_template.log_file_path, "w");
+    if (log_file == NULL) {
+        fprintf(stderr, "Error: Could not open log file %s\n", config_template.log_file_path);
+        free(pristine_params_memory);
+        dataloader_free(&train_loader);
+        dataloader_free(&val_loader);
+        tokenizer_free(&tokenizer);
+        gpt2_free(&base_model_template);
+        return 1;
+    }
+
+    fprintf(log_file, "DoRA_Rank,GQA_Groups,AvgTrainLoss,FinalValLoss,TimePerTrainStepMS,TimePerGenTokenMS,NumDoRAParams,NumBaseParams,NumTrainableParams,MemSavedMB,MemSavedPercent\n");
+    fflush(log_file);
+
+    for (int r_idx = 0; r_idx < num_dora_ranks; ++r_idx) {
+        for (int g_idx = 0; g_idx < num_gqa_groups; ++g_idx) {
+            size_t current_r = dora_ranks_to_test[r_idx];
+            size_t current_g = gqa_groups_to_test[g_idx];
+
+            printf("\n=================================================\n");
+            printf("Starting Run: DoRA Rank = %zu, GQA Groups = %zu\n", current_r, current_g);
+            printf("=================================================\n");
+
+            GPT2 current_run_model;
+            memcpy(&current_run_model, &base_model_template, sizeof(GPT2));
+            current_run_model.params_memory = (float*)mallocCheck(base_model_template.num_parameters * sizeof(float));
+            memcpy(current_run_model.params_memory, pristine_params_memory, base_model_template.num_parameters * sizeof(float));
+            gpt2_repoint_parameters(&current_run_model.params, current_run_model.param_sizes, current_run_model.params_memory);
+            current_run_model.grads_memory = NULL; current_run_model.m_memory = NULL; current_run_model.v_memory = NULL;
+            current_run_model.acts_memory = NULL; current_run_model.grads_acts_memory = NULL;
+            current_run_model.inputs = NULL; current_run_model.targets = NULL;
+            current_run_model.params_memory_dora = NULL; current_run_model.grads_memory_dora = NULL;
+            current_run_model.m_memory_dora = NULL; current_run_model.v_memory_dora = NULL;
+            current_run_model.dora_temp_storage = NULL;
+            current_run_model.num_parameters_dora = 0;
+
+            printf("Model structure reset for new run.\n");
+
+
+            if (base_num_heads % current_g != 0) {
+                 fprintf(stderr, "Skipping: Num heads %d not divisible by GQA groups %zu\n",
+                         base_num_heads, current_g);
+                 free(current_run_model.params_memory);
+                 continue;
+            }
+            current_run_model.config.num_kv_heads = base_num_heads / current_g;
+            printf("Configuring GQA: num_kv_heads = %d\n", current_run_model.config.num_kv_heads);
+
+            allocate_and_init_dora(&current_run_model, current_r);
+            printf("DORA (r=%zu) and GQA adaptation complete for this run.\n", current_r);
+
+            EvalResult result = evaluate_model_finetune(&current_run_model,
+                                                        &train_loader,
+                                                        &val_loader,
+                                                        &tokenizer,
+                                                        &config_template,
+                                                        current_r,
+                                                        current_g);
+
+
+            log_results(log_file, current_r, current_g, &result);
+            printf("Results logged.\n");
+
+            gpt2_free(&current_run_model);
+            printf("Cleaned up memory for this run.\n");
+
+            printf("Finished Run: DoRA Rank = %zu, GQA Groups = %zu\n", current_r, current_g);
+
+        }
+    }
+
+    printf("Closing log file.\n");
+    fclose(log_file);
+    printf("Freeing data loaders...\n");
     dataloader_free(&train_loader);
     dataloader_free(&val_loader);
+    printf("Freeing tokenizer...\n");
     tokenizer_free(&tokenizer);
-    gpt2_free(&model);
-    free(gen_tokens);
+    printf("Freeing base model template and pristine parameters...\n");
+    gpt2_free(&base_model_template);
+    free(pristine_params_memory);
+    printf("Cleanup complete.\n");
+
+    printf("\nHyperparameter evaluation finished. Results logged to %s\n", config_template.log_file_path);
     return 0;
 }
+
 #endif
